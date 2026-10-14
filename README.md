@@ -89,6 +89,9 @@ Each client entry has exactly these keys:
 | `post_logout_redirect_uris` | list (may be empty), matched exactly |
 | `smb_binding` | `null` (no corporate check; e.g. the portal, which checks the claims itself) or the `custom:corporate_id` every user must carry |
 
+A static `client_id` of Fleet's `fd-<uuid>` form refuses startup: static
+clients are looked up first, so it would shadow the Fleet entry.
+
 Every registered URI must pass the strict parse: absolute `http(s)`, ASCII, no
 whitespace, no `\`, no fragment, no userinfo, no `%` in the authority, no dot
 segments (also percent-encoded).
@@ -119,6 +122,11 @@ yields neither, so every request is refused. Its `smb_id` is the binding,
 compared verbatim with `custom:corporate_id`; an empty `smb_id` admits no one.
 `<app>-mcp.<base>` redirect hosts are not supported (FOSS-623, FOSS-624).
 
+**Known cost: no negative cache.** A "no" is never cached, so a new
+deployment can sign in at once, and every request naming a well-formed but
+unknown `fd-<uuid>` costs one Fleet call. Bounding that is ingress rate
+limiting in this service's deployment (FOSS-613), not code here.
+
 **`/logout` is an exact match on purpose.** Each cluster's oauth2-proxy
 whitelists this service's host so its sign-out can send the browser here
 (FOSS-607 §3.3). That is safe only while `/logout` redirects nowhere but a
@@ -137,7 +145,7 @@ asked. A suspended deployment may still sign out.
 | `POST /token` | form: `grant_type=authorization_code`, `code`, `code_verifier`, `redirect_uri`, or `grant_type=refresh_token`, `refresh_token`; client auth by `client_secret_basic` **or** `client_secret_post` | 401 `invalid_client`: no, unknown or wrong credentials. 503 `temporarily_unavailable`: Fleet could not be asked (see above). 400 `unauthorized_client`: a Fleet client that is not active. 400 `invalid_request`: both auth methods. 400 `unsupported_grant_type`: anything else. 400 `invalid_grant`: unknown, used or expired (60 s) code; code issued to another client; `redirect_uri` not equal to the one at `/authorize`; a verifier outside RFC 7636's format, or one not matching the challenge. Client authentication runs first: a request with bad credentials leaves the code untouched, but once the client authenticates, the presented code is consumed even if the redemption is then refused |
 | `GET /.well-known/openid-configuration` | | |
 | `GET /.well-known/jwks.json` | | |
-| `GET /logout` | `client_id`, `post_logout_redirect_uri` | 400, no redirect: unknown client, or a URI not exactly in its `post_logout_redirect_uris`. 503: Fleet could not be asked. Success: 302 to the IdP sign-out, which returns to `/signed-out`, which re-checks and returns to the URI |
+| `GET /logout` | `client_id`, `post_logout_redirect_uri`, optional `id_token_hint` (ends the refresh session, see "Refresh") | 400, no redirect: unknown client, or a URI not exactly in its `post_logout_redirect_uris`. 503: Fleet could not be asked. Success: 302 to the IdP sign-out, which returns to `/signed-out`, which re-checks and returns to the URI |
 | `GET /signed-out` | `__Host-mpass_logout` cookie | without a valid cookie: a "signed out" page, no redirect |
 
 `/token` success returns `id_token` and `access_token`, both RS256 JWTs signed
@@ -150,8 +158,10 @@ absent if Cognito sent none), plus `nonce` in the id_token if one was sent.
 `expires_in` is 3600. No Cognito token is returned.
 
 **Refresh (FOSS-611).** When Cognito sent a refresh token, `/token` returns a
-`refresh_token` that is an opaque handle: Redis `central_refresh:{handle}`
-holds the client_id, the `sub` and the Cognito refresh token. A refresh
+`refresh_token` that is an opaque handle. Redis `central_refresh:{sid}`, where
+the session id `sid` is the handle's sha256, holds the client_id, the `sub`,
+the Cognito refresh token and the session's absolute end; Redis never holds a
+presentable handle. Every token issued for the session carries `sid`. A refresh
 authenticates the client (which must be active), requires the handle to be
 that client's, refreshes at Cognito with the central client (and
 `OIDC_CLIENT_SECRET`), verifies both new tokens for the same `sub`, re-checks
@@ -173,8 +183,17 @@ Why it is built this way:
   deployment X is useless at Y, and useless at X without X's secret.
 - **Not rotated.** oauth2-proxy can refresh one session concurrently, and a
   rotating handle would log the user out on the second delivery. A replayed
-  refresh therefore succeeds. Each refresh renews the TTL
-  (`SESSION_COOKIE_MAX_AGE_SECONDS`).
+  refresh therefore succeeds.
+- **12 h absolute.** A session ends 12 h after sign-in (`CENTRAL_SESSION_MAX`),
+  whatever happens: a refresh keeps the remaining lifetime and never extends
+  it, and a refresh past the end is `invalid_grant`.
+- **Sign-out ends it.** `/logout?id_token_hint=<id_token>` deletes the session
+  the token's `sid` names, so a copied session cookie cannot refresh after
+  sign-out. The hint must be signed by this service for that `client_id`; an
+  expired one still counts. A missing or bad hint is ignored and the sign-out
+  proceeds. **This only works if the cluster's sign-out sends the hint**, which
+  is oauth2-proxy configuration (FOSS-463) and not verified here; without it a
+  copied session still ends at the 12 h bound.
 - **Accepted cost:** the handles live only in Redis (Valkey). Losing it ends
   every central session at its next refresh (oauth2-proxy refreshes every
   3000 s), and users sign in again.

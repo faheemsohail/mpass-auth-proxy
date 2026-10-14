@@ -68,6 +68,8 @@ def _parse_clients(doc) -> dict[str, dict]:
             raise bad(f"keys must be exactly {sorted(_CLIENT_KEYS)}")
         if not isinstance(cid, str) or not cid or cid in clients:
             raise bad("client_id must be a unique, non-empty string")
+        if _FLEET_CLIENT_ID.fullmatch(cid):
+            raise bad("client_id has Fleet's fd-<uuid> form and would shadow its registry entry")
         hashes = c["secret_sha256"]
         if not isinstance(hashes, list) or not hashes or not all(
             isinstance(h, str) and _SHA256_HEX.fullmatch(h) for h in hashes
@@ -107,6 +109,9 @@ def _load_clients(path: str) -> dict[str, dict]:
 FLOW_COOKIE = "__Host-mpass_flow"
 LOGOUT_COOKIE = "__Host-mpass_logout"
 CENTRAL_TOKEN_TTL: int = 3600
+# A central session ends this long after sign-in, whatever happens: a refresh
+# never extends it (security review of #12, LOW-1; the 12 h absolute rule).
+CENTRAL_SESSION_MAX: int = 12 * 3600
 # Stopgap against a login swap (the IdP leg carries no state, so a captured
 # /mpass-callback URL could complete someone else's flow): Cognito tokens must be
 # minted after the flow began, allowing this much clock skew. It narrows the
@@ -315,10 +320,19 @@ def _claims_to_sign(id_claims: dict, access: dict) -> dict:
     return claims
 
 
+def _sid(handle: str) -> str:
+    """The session id: the refresh handle's sha256. Redis keys sessions by it, so
+    Redis never holds a presentable handle, and tokens carry it as `sid` so
+    /logout can end the session from an id_token_hint."""
+    return hashlib.sha256(handle.encode()).hexdigest()
+
+
 def _token_body(client_id: str, claims: dict, nonce: str = "", refresh_handle: str = "") -> Response:
     now = int(time.time())
     base = {**claims, "iss": m.MPASS_PROXY_ISSUER_URL, "aud": client_id,
             "iat": now, "exp": now + CENTRAL_TOKEN_TTL}
+    if refresh_handle:
+        base["sid"] = _sid(refresh_handle)
     id_claims = {**base, "token_use": "id"}
     if nonce:
         id_claims["nonce"] = nonce
@@ -529,9 +543,10 @@ async def _central_token(request: Request) -> Response:
     handle = ""
     if data.get("idp_refresh_token"):
         handle = secrets.token_urlsafe(32)
-        await m.redis_client.setex(f"central_refresh:{handle}", m.SESSION_EXPIRES_IN, json.dumps({
+        await m.redis_client.setex(f"central_refresh:{_sid(handle)}", CENTRAL_SESSION_MAX, json.dumps({
             "client_id": client_id, "sub": data["claims"].get("sub"),
             "idp_refresh_token": data["idp_refresh_token"],
+            "expires_at": int(time.time()) + CENTRAL_SESSION_MAX,
         }))
     logger.info("central: token issued client_id=%r sub=%s", client_id, data["claims"].get("sub"))
     return _token_body(client_id, data["claims"], data["nonce"], handle)
@@ -554,12 +569,16 @@ async def _central_refresh(client: dict, handle: str) -> Response:
     A refusal that is an answer (unknown handle, the IdP says no, the binding
     fails) burns the handle; "we could not ask" (IdP unreachable) keeps it."""
     client_id = client["client_id"]
-    key = f"central_refresh:{handle}"
+    key = f"central_refresh:{_sid(handle)}"
     raw = await m.redis_client.get(key) if handle else None
     rec = json.loads(raw) if raw else None
     if rec is None or rec["client_id"] != client_id:
         logger.info("central: refused outcome=refresh_unknown client_id=%r", client_id)
         return m._token_error("invalid_grant", "Invalid or expired refresh token")
+    if rec["expires_at"] <= int(time.time()):  # Redis's TTL should have got here first
+        await m.redis_client.delete(key)
+        logger.info("central: refused outcome=session_expired client_id=%r sub=%s", client_id, rec["sub"])
+        return m._token_error("invalid_grant", "Session expired; sign in again")
 
     payload = {"grant_type": "refresh_token", "client_id": m.OIDC_CLIENT_ID,
                "refresh_token": rec["idp_refresh_token"]}
@@ -601,7 +620,8 @@ async def _central_refresh(client: dict, handle: str) -> Response:
 
     if tokens.get("refresh_token"):  # Cognito rotation, if it is ever turned on
         rec["idp_refresh_token"] = tokens["refresh_token"]
-    await m.redis_client.setex(key, m.SESSION_EXPIRES_IN, json.dumps(rec))
+    # The remaining lifetime only: a refresh never extends the session.
+    await m.redis_client.setex(key, max(1, rec["expires_at"] - int(time.time())), json.dumps(rec))
     logger.info("central: token refreshed client_id=%r sub=%s", client_id, rec["sub"])
     return _token_body(client_id, _claims_to_sign(id_claims, access), refresh_handle=handle)
 
@@ -626,6 +646,30 @@ async def openid_configuration() -> dict:
     }
 
 
+async def _end_session(client_id: str, hint: str) -> None:
+    """Delete the refresh session an id_token_hint names, so a copied session
+    cannot refresh after sign-out. The hint must be ours and for this client;
+    an expired one still counts (OIDC RP-initiated logout). Anything else is
+    ignored: the sign-out itself still proceeds."""
+    if not hint:
+        return
+    try:
+        claims = jwt.decode(hint, m._SIGNING_PRIVATE_KEY.public_key(), algorithms=["RS256"],
+                            audience=client_id, issuer=m.MPASS_PROXY_ISSUER_URL,
+                            options={"verify_exp": False})
+    except InvalidTokenError:
+        logger.info("central: logout id_token_hint ignored client_id=%r", client_id)
+        return
+    sid = claims.get("sid")
+    if not isinstance(sid, str) or not _SHA256_HEX.fullmatch(sid):
+        return
+    key = f"central_refresh:{sid}"
+    raw = await m.redis_client.get(key)
+    if raw and json.loads(raw)["client_id"] == client_id:
+        await m.redis_client.delete(key)
+        logger.info("central: session ended client_id=%r sub=%s", client_id, claims.get("sub"))
+
+
 @router.get("/logout")
 async def central_logout(request: Request) -> Response:
     if not m._CLIENTS:
@@ -645,6 +689,7 @@ async def central_logout(request: Request) -> Response:
         return _refuse("redirect_refused", client_id)
     # Cognito returns to one registered logout_uri (/signed-out); the cookie
     # carries the destination there, and /signed-out checks it again.
+    await _end_session(client_id, request.query_params.get("id_token_hint", ""))
     params = {"client_id": m.OIDC_CLIENT_ID, "logout_uri": f"{m.MPASS_PROXY_ISSUER_URL}/signed-out"}
     sep = "&" if "?" in m.OIDC_LOGOUT_URI else "?"
     response = RedirectResponse(url=f"{m.OIDC_LOGOUT_URI}{sep}{urlencode(params)}", status_code=302)

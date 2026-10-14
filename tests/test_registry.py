@@ -526,6 +526,12 @@ class TestConfig:
 # re-checked on every refresh.
 # ---------------------------------------------------------------------------
 
+def rkey(handle):
+    """Redis key of a refresh handle: keyed by its sha256 (the session id), so
+    Redis never holds a handle a client could present."""
+    return "central_refresh:" + _sha(handle)
+
+
 def refresh(proxy, handle, client=FD1, secret=SECRET_1):
     return token(proxy, None, client, secret=secret, grant_type="refresh_token", refresh_token=handle,
                  code_verifier=None, redirect_uri=None)
@@ -539,8 +545,9 @@ class TestRefresh:
 
     def test_issues_an_opaque_handle_not_the_idp_token(self, fp, stub, store, handle):
         assert not handle.startswith("stub-refresh:") and len(handle) >= 32
-        ttl, raw = store[f"central_refresh:{handle}"]
-        assert ttl == m.SESSION_EXPIRES_IN
+        assert not any(handle in k for k in store)
+        ttl, raw = store[rkey(handle)]
+        assert ttl == c.CENTRAL_SESSION_MAX == 12 * 3600
         rec = json.loads(raw)
         assert rec["client_id"] == ID1 and rec["idp_refresh_token"] == "stub-refresh:alice"
 
@@ -594,18 +601,18 @@ class TestRefresh:
         c._registry_cache.clear()
         r = refresh(fp, handle)
         assert r.status_code == 403 and r.json()["error"] == "access_denied"
-        assert f"central_refresh:{handle}" not in store  # an answer, so the handle is burned
+        assert rkey(handle) not in store  # an answer, so the handle is burned
 
     def test_idp_refuses_burns_the_handle(self, fp, store, handle):
-        ttl, raw = store[f"central_refresh:{handle}"]
-        store[f"central_refresh:{handle}"] = (ttl, json.dumps({**json.loads(raw), "idp_refresh_token": "revoked"}))
+        ttl, raw = store[rkey(handle)]
+        store[rkey(handle)] = (ttl, json.dumps({**json.loads(raw), "idp_refresh_token": "revoked"}))
         r = refresh(fp, handle)
         assert r.status_code == 400 and r.json()["error"] == "invalid_grant"
-        assert f"central_refresh:{handle}" not in store
+        assert rkey(handle) not in store
 
     def test_idp_for_another_user_refused(self, fp, store, handle):
-        ttl, raw = store[f"central_refresh:{handle}"]
-        store[f"central_refresh:{handle}"] = (ttl, json.dumps({**json.loads(raw), "idp_refresh_token": "stub-refresh:adam"}))
+        ttl, raw = store[rkey(handle)]
+        store[rkey(handle)] = (ttl, json.dumps({**json.loads(raw), "idp_refresh_token": "stub-refresh:adam"}))
         r = refresh(fp, handle)
         assert r.status_code == 400 and r.json()["error"] == "invalid_grant"
 
@@ -615,7 +622,7 @@ class TestRefresh:
         monkeypatch.setattr(m, "_get_token_endpoint", down)
         r = refresh(fp, handle)
         assert r.status_code == 503 and r.json()["error"] == "temporarily_unavailable"
-        assert f"central_refresh:{handle}" in store  # could not ask is not no
+        assert rkey(handle) in store  # could not ask is not no
 
     def test_static_client_refresh_keeps_its_rule(self, fp, stub):
         from tests.test_central import PORTAL_SECRET
@@ -640,7 +647,7 @@ class TestRefresh:
             return f"http://{FLEET_HOST}/idp-token/{error}"
         monkeypatch.setattr(m, "_get_token_endpoint", endpoint)
         assert refresh(fp, handle).status_code == 503
-        assert f"central_refresh:{handle}" in store
+        assert rkey(handle) in store
 
 
 
@@ -766,3 +773,101 @@ class TestFleetLogout:
         fleet.down = True
         r = fp.get("/signed-out")
         assert r.status_code == 200 and "location" not in r.headers
+
+
+
+# ---------------------------------------------------------------------------
+# Security review of #12, LOW-1: a session ends at sign-out, and at 12 h
+# from sign-in whatever happens (absolute, never extended by a refresh).
+# ---------------------------------------------------------------------------
+
+class TestSessionEnd:
+    @pytest.fixture
+    def body(self, fp, stub):
+        return fd_token(fp, code_of(sign_in(fp, stub, "alice", FD1))).json()
+
+    def sid(self, fp, tok, aud=ID1):
+        return jwt.decode(tok, proxy_key(fp), algorithms=["RS256"], audience=aud, issuer=ISSUER)["sid"]
+
+    def test_tokens_carry_the_session_id(self, fp, body):
+        sid = _sha(body["refresh_token"])
+        assert self.sid(fp, body["id_token"]) == sid == self.sid(fp, body["access_token"])
+        again = refresh(fp, body["refresh_token"]).json()
+        assert self.sid(fp, again["id_token"]) == sid
+
+    def age(self, store, handle, seconds):
+        """Make the session `seconds` older. (Moving the clock instead would
+        make the stub IdP mint tokens PyJWT, on the real clock, calls future.)"""
+        ttl, raw = store[rkey(handle)]
+        rec = json.loads(raw)
+        store[rkey(handle)] = (ttl - seconds, json.dumps({**rec, "expires_at": rec["expires_at"] - seconds}))
+
+    def test_session_is_12h_from_sign_in(self, fp, store, body):
+        ttl, raw = store[rkey(body["refresh_token"])]
+        assert ttl == 12 * 3600
+        assert abs(json.loads(raw)["expires_at"] - (m.time.time() + 12 * 3600)) < 5
+
+    def test_refresh_does_not_extend_the_session(self, fp, store, body):
+        self.age(store, body["refresh_token"], 3600)
+        assert refresh(fp, body["refresh_token"]).status_code == 200
+        ttl, _ = store[rkey(body["refresh_token"])]
+        assert 12 * 3600 - 3600 - 5 <= ttl <= 12 * 3600 - 3600
+
+    def test_session_ends_12h_after_sign_in(self, fp, store, body):
+        self.age(store, body["refresh_token"], 12 * 3600)  # still in the fake store: the check is ours
+        r = refresh(fp, body["refresh_token"])
+        assert r.status_code == 400 and r.json()["error"] == "invalid_grant"
+        assert rkey(body["refresh_token"]) not in store
+
+    def test_just_before_12h_still_refreshes(self, fp, store, body):
+        self.age(store, body["refresh_token"], 12 * 3600 - 30)
+        assert refresh(fp, body["refresh_token"]).status_code == 200
+
+    def logout(self, fp, hint, client_id=ID1):
+        return fp.get("/logout", params={"client_id": client_id, "id_token_hint": hint,
+                                         "post_logout_redirect_uri": f"https://auth.{BASE_1}/"})
+
+    def test_logout_with_id_token_hint_ends_the_session(self, fp, store, body):
+        assert self.logout(fp, body["id_token"]).status_code == 302
+        assert rkey(body["refresh_token"]) not in store
+        r = refresh(fp, body["refresh_token"])
+        assert r.status_code == 400 and r.json()["error"] == "invalid_grant"
+
+    def test_a_refreshed_id_token_also_ends_it(self, fp, store, body):
+        again = refresh(fp, body["refresh_token"]).json()
+        assert self.logout(fp, again["id_token"]).status_code == 302
+        assert rkey(body["refresh_token"]) not in store
+
+    def test_hint_for_another_client_does_not_end_it(self, fp, store, body):
+        # fd-2222 cannot end fd-1111's sessions with fd-1111's token.
+        r = fp.get("/logout", params={"client_id": ID2, "id_token_hint": body["id_token"],
+                                      "post_logout_redirect_uri": f"https://auth.{BASE_2}/"})
+        assert r.status_code == 302
+        assert rkey(body["refresh_token"]) in store
+
+    def test_forged_hint_does_not_end_it(self, fp, store, body, idp_sign):
+        claims = jwt.decode(body["id_token"], options={"verify_signature": False})
+        assert self.logout(fp, idp_sign(claims)).status_code == 302  # signed by someone else
+        assert rkey(body["refresh_token"]) in store
+
+    def test_expired_hint_still_ends_it(self, fp, store, body):
+        # The 1 h id_token has usually expired by sign-out; it must still count.
+        claims = jwt.decode(body["id_token"], options={"verify_signature": False})
+        expired = c._sign({**claims, "iat": claims["iat"] - 7200, "exp": claims["iat"] - 3600})
+        with pytest.raises(jwt.ExpiredSignatureError):
+            jwt.decode(expired, proxy_key(fp), algorithms=["RS256"], audience=ID1, issuer=ISSUER)
+        assert self.logout(fp, expired).status_code == 302
+        assert rkey(body["refresh_token"]) not in store
+
+    def test_logout_without_hint_still_signs_out(self, fp, store, body):
+        r = fp.get("/logout", params={"client_id": ID1, "post_logout_redirect_uri": f"https://auth.{BASE_1}/"})
+        assert r.status_code == 302 and rkey(body["refresh_token"]) in store
+
+
+class TestStaticIdsCannotShadowFleet:
+    def test_static_fd_uuid_refused_at_load(self):
+        with pytest.raises(RuntimeError):
+            c._parse_clients({"clients": [{**PORTAL, "client_id": ID1}]})
+
+    def test_static_fd_non_uuid_still_allowed(self):
+        assert "fd-a" in c._parse_clients({"clients": [{**PORTAL, "client_id": "fd-a"}]})
