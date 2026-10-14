@@ -3,10 +3,12 @@
 In-process only: main's httpx calls are routed into the fake via ASGITransport,
 so nothing binds a port.
 """
-import json
+import os
+import re
 import sys
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from html import unescape
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 import jwt
@@ -29,9 +31,12 @@ def allow(monkeypatch):
     monkeypatch.setenv(fake_mpass.GUARD_VAR, "1")
 
 
+ALLOWED = ["https://test-auth.example.com/", "http://localhost/bye"]
+
+
 @pytest.fixture
 def fake():
-    return TestClient(fake_mpass.create_app(issuer=m.OIDC_ISSUER_URL))
+    return TestClient(fake_mpass.create_app(issuer=m.OIDC_ISSUER_URL, allowed_redirects=ALLOWED))
 
 
 @pytest.fixture
@@ -72,8 +77,8 @@ def sign_in(proxy, fake, user, state="s1"):
     login = urlparse(r.headers["location"])
     assert login.path == "/users/login"
     page = fake.get(f"{login.path}?{login.query}")
-    assert f"user={user}" in page.text
-    r = fake.get(f"/users/login/as?user={user}&{login.query}", follow_redirects=False)
+    href = next(unescape(h) for h in re.findall(r'href="([^"]+)"', page.text) if f"user={user}&" in unescape(h))
+    r = fake.get(href, follow_redirects=False)
     cb = urlparse(r.headers["location"])
     assert f"{cb.scheme}://{cb.netloc}{cb.path}" == m.MPASS_CALLBACK_URL
     return proxy.get(f"{cb.path}?{cb.query}", cookies={"mpass_bridge": state})
@@ -86,8 +91,12 @@ def exchange(proxy, callback_resp):
     })
 
 
-def test_guard_refuses_without_ack(monkeypatch):
-    monkeypatch.delenv(fake_mpass.GUARD_VAR)
+@pytest.mark.parametrize("value", [None, "", "0", "true", "TRUE", " 1"])
+def test_guard_refuses_without_ack(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv(fake_mpass.GUARD_VAR)
+    else:
+        monkeypatch.setenv(fake_mpass.GUARD_VAR, value)
     with pytest.raises(RuntimeError, match="refuses to start"):
         fake_mpass.create_app(issuer=m.OIDC_ISSUER_URL)
 
@@ -96,7 +105,8 @@ def test_discovery_and_jwks(fake):
     base = urlparse(m.OIDC_ISSUER_URL).path
     disc = fake.get(f"{base}/.well-known/openid-configuration").json()
     assert disc["issuer"] == m.EXPECTED_ISSUER
-    assert disc["token_endpoint"].endswith("/oauth2/token")
+    u = urlparse(m.OIDC_ISSUER_URL)
+    assert disc["token_endpoint"] == f"{u.scheme}://{u.netloc}/oauth2/token"
     assert fake.get(f"{base}/.well-known/jwks.json").json()["keys"][0]["alg"] == "RS256"
 
 
@@ -114,6 +124,7 @@ def test_full_flow_issues_verifiable_tokens(proxy, fake):
     # access_token is the fake's, verified against the fake's JWKS.
     key = PyJWK.from_dict(fake.get(urlparse(m.OIDC_ISSUER_URL).path + "/.well-known/jwks.json").json()["keys"][0]).key
     access = jwt.decode(tok["access_token"], key, algorithms=["RS256"], options={"verify_aud": False}, issuer=m.EXPECTED_ISSUER)
+    assert access["exp"] - access["iat"] == 3600
     assert access["username"] == "alice" and access["custom:corporate_id"] == "corp-a"
     # id_token is re-signed by the proxy (email capture on in tests/.env.test).
     ident = jwt.decode(tok["id_token"], m._SIGNING_PRIVATE_KEY.public_key(), algorithms=["RS256"], audience=m.OIDC_CLIENT_ID, options={"verify_iss": False})
@@ -145,6 +156,13 @@ def test_refresh(proxy, fake, monkeypatch):
     assert body["refresh_token"] == tok["refresh_token"]  # fake, like Cognito, does not rotate
 
 
+def test_fake_token_endpoint_shape(fake):
+    r = fake.post("/oauth2/token", data={"grant_type": "refresh_token", "refresh_token": "fake-refresh:bob", "client_id": "c"})
+    body = r.json()
+    assert "refresh_token" not in body and body["expires_in"] == 3600
+    assert fake.post("/oauth2/token", data={"grant_type": "password"}).json() == {"error": "unsupported_grant_type"}
+
+
 def test_refresh_refused_for_bad_token(proxy):
     for bad in ("nope", fake_mpass.REFRESH_PREFIX + "ghost"):
         r = proxy.post("/token", data={"grant_type": "refresh_token", "refresh_token": bad})
@@ -154,3 +172,57 @@ def test_refresh_refused_for_bad_token(proxy):
 def test_logout_redirects_to_logout_uri(fake):
     r = fake.get("/logout", params={"client_id": "c", "logout_uri": "http://localhost/bye"}, follow_redirects=False)
     assert r.headers["location"] == "http://localhost/bye"
+
+
+def test_proxy_mpass_logout_chains_through_fake_logout(proxy, fake, monkeypatch):
+    monkeypatch.setattr(m, "OIDC_LOGOUT_URI", "http://fake.local/logout")
+    monkeypatch.setattr(m, "LOGOUT_REDIRECT_URL", "http://localhost/bye")
+    r = proxy.get("/mpass/logout")
+    rd = unquote(parse_qs(urlparse(r.headers["location"]).query)["rd"][0])
+    r = fake.get(urlparse(rd).path + "?" + urlparse(rd).query, follow_redirects=False)
+    assert r.headers["location"] == "http://localhost/bye"
+
+
+BAD_URLS = [
+    "http://evil.example.com/bye",
+    "http://localhost.evil.com/bye",
+    "http://localhost@evil.com/bye",
+    "http://evil.com\\@localhost/bye",
+    "http://localhost:81/bye",
+    "https://localhost/bye",
+    "http://localhost/other",
+    "javascript:alert(1)",
+]
+
+
+@pytest.mark.parametrize("url", BAD_URLS)
+def test_disallowed_redirects_refused(fake, url):
+    r = fake.get("/users/login/as", params={"user": "alice", "client_id": "c", "client_redirect_url": url}, follow_redirects=False)
+    assert r.status_code == 400 and "location" not in r.headers
+    r = fake.get("/logout", params={"logout_uri": url}, follow_redirects=False)
+    assert r.status_code == 200 and "location" not in r.headers
+
+
+def test_unset_allowlist_refuses_everything(monkeypatch):
+    monkeypatch.delenv("FAKE_MPASS_ALLOWED_REDIRECTS", raising=False)
+    f = TestClient(fake_mpass.create_app(issuer="http://x/p"))
+    r = f.get("/users/login/as", params={"user": "alice", "client_id": "c", "client_redirect_url": "http://localhost/bye"}, follow_redirects=False)
+    assert r.status_code == 400
+    assert "location" not in f.get("/logout", params={"logout_uri": "http://localhost/bye"}, follow_redirects=False).headers
+
+
+def test_allowlist_from_env_and_path_prefix(monkeypatch):
+    monkeypatch.setenv("FAKE_MPASS_ALLOWED_REDIRECTS", "http://a.local:9000, http://b.local/cb")
+    f = TestClient(fake_mpass.create_app(issuer="http://x/p"))
+    ok = lambda u: f.get("/logout", params={"logout_uri": u}, follow_redirects=False).status_code == 302
+    assert ok("http://a.local:9000/any/path?x=1") and ok("http://b.local/cb") and ok("http://b.local/cb/deep")
+    assert not ok("http://b.local/cbx") and not ok("http://a.local/any")
+
+
+def test_key_file_is_private(tmp_path):
+    kf = tmp_path / "k.pem"
+    fake_mpass.create_app(issuer="http://x/p", key_file=str(kf))
+    assert kf.stat().st_mode & 0o777 == 0o600
+    kf.chmod(0o644)
+    with pytest.raises(RuntimeError, match="readable"):
+        fake_mpass.create_app(issuer="http://x/p", key_file=str(kf))

@@ -45,14 +45,16 @@ Override with `FAKE_MPASS_USERS_FILE`. Entries: `username`, `email`, optional
 |---|---|
 | `FAKE_MPASS_I_KNOW_THIS_IS_NOT_PRODUCTION` | must be `1` or it will not start |
 | `FAKE_MPASS_ISSUER_URL` | required; must equal the proxy's `OIDC_ISSUER_URL`. Its path is where discovery/JWKS are served, its origin is where `/oauth2/token` is advertised |
+| `FAKE_MPASS_ALLOWED_REDIRECTS` | comma-separated URLs; `client_redirect_url` and `logout_uri` must match one by exact origin + path prefix (like Cognito's registered URLs). Unset = every login is a 400 and logout shows a page without redirecting. E.g. `https://auth.<domain>/mpass-callback,https://<domain>/` |
 | `FAKE_MPASS_USERS_FILE` | optional, default `users.json` |
-| `FAKE_MPASS_KEY_FILE` | optional PEM path: loaded if present, else generated and written there, so the kid survives restarts. Unset = new key each start |
+| `FAKE_MPASS_KEY_FILE` | optional PEM path: loaded if present, else generated and written there, so the kid survives restarts (created 0600, a group/world-readable existing file is refused). In the container `/app` is root-owned, so mount a writable volume for this path. Unset = new key each start |
 
 ## Run
 
 ```bash
 pip install -r requirements.txt
 export FAKE_MPASS_I_KNOW_THIS_IS_NOT_PRODUCTION=1 FAKE_MPASS_ISSUER_URL=http://127.0.0.1:9101/pool
+export FAKE_MPASS_ALLOWED_REDIRECTS=http://127.0.0.1:8000/mpass-callback
 uvicorn --factory fake_mpass:create_app --host 127.0.0.1 --port 9101 --no-access-log
 ```
 
@@ -79,3 +81,8 @@ verification, the `SMB_CORPORATE_ID` check (bob and ivan refused when set to
 - Tokens expire after 1 hour. No MFA, QR flow, or error pages of the real hosted UI.
 - The synthetic `email` of real mPass users (`cognito:default_val`) is not imitated;
   the fake sends a plausible address.
+- Discovery has no `authorization_endpoint` (the proxy never reads it). oauth2-proxy
+  verifying against the fake's discovery, which it does when `LAUNCHPAD_EMAIL_CAPTURE`
+  is off, will not find one; point it at the proxy's own discovery instead.
+- `/logout` is tested directly and through `main.py`'s `/mpass/logout` redirect chain,
+  but not through a real oauth2-proxy `sign_out`.

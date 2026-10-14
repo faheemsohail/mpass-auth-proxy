@@ -27,20 +27,46 @@ GUARD_VAR = "FAKE_MPASS_I_KNOW_THIS_IS_NOT_PRODUCTION"
 def _load_key(path: str):
     p = Path(path) if path else None
     if p and p.exists():
+        if p.stat().st_mode & 0o077:
+            raise RuntimeError(f"fake-mpass: key file {p} is group/world readable; chmod 600 it")
         return serialization.load_pem_private_key(p.read_bytes(), password=None)
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     if p:
-        p.write_bytes(key.private_bytes(
+        pem = key.private_bytes(
             serialization.Encoding.PEM,
             serialization.PrivateFormat.PKCS8,
             serialization.NoEncryption(),
-        ))
-        p.chmod(0o600)
+        )
+        # O_EXCL: never follow or clobber an existing path; 0600 from creation.
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(pem)
     return key
 
 
+def _redirect_allowed(url: str, allowed: list[str]) -> bool:
+    """Exact origin + path prefix match against the allowlist (like Cognito's
+    registered URLs). Rejects userinfo and backslashes outright."""
+    if "\\" in url:
+        return False
+    u = urlparse(url)
+    if u.scheme not in ("http", "https") or "@" in u.netloc or not u.hostname:
+        return False
+    for entry in allowed:
+        a = urlparse(entry)
+        if (a.scheme, a.netloc.lower()) != (u.scheme, u.netloc.lower()):
+            continue
+        base = a.path.rstrip("/")
+        if u.path == base or u.path.startswith(base + "/"):
+            return True
+    return False
+
+
 def create_app(
-    issuer: str | None = None, users_file: str | None = None, key_file: str | None = None
+    issuer: str | None = None,
+    users_file: str | None = None,
+    key_file: str | None = None,
+    allowed_redirects: list[str] | None = None,
 ) -> FastAPI:
     if os.environ.get(GUARD_VAR) != "1":
         raise RuntimeError(
@@ -52,6 +78,10 @@ def create_app(
         "FAKE_MPASS_USERS_FILE", str(Path(__file__).with_name("users.json"))
     )
     key = _load_key(key_file if key_file is not None else os.environ.get("FAKE_MPASS_KEY_FILE", ""))
+    if allowed_redirects is None:
+        allowed_redirects = [
+            x.strip() for x in os.environ.get("FAKE_MPASS_ALLOWED_REDIRECTS", "").split(",") if x.strip()
+        ]
     users = {u["username"]: u for u in json.loads(Path(users_file).read_text())["users"]}
 
     kid = hashlib.sha256(key.public_key().public_bytes(
@@ -107,7 +137,7 @@ def create_app(
 
     @app.get("/users/login/as")
     def login_as(user: str, client_id: str, client_redirect_url: str):
-        if user not in users or urlparse(client_redirect_url).scheme not in ("http", "https"):
+        if user not in users or not _redirect_allowed(client_redirect_url, allowed_redirects):
             return JSONResponse({"error": "bad request"}, status_code=400)
         t = tokens(user, client_id)
         t["refresh_token"] = REFRESH_PREFIX + user
@@ -126,7 +156,7 @@ def create_app(
 
     @app.get("/logout")
     def logout(client_id: str = "", logout_uri: str = ""):
-        if urlparse(logout_uri).scheme not in ("http", "https"):
+        if not _redirect_allowed(logout_uri, allowed_redirects):
             return HTMLResponse("fake-mpass: signed out")
         return RedirectResponse(logout_uri, status_code=302)
 
