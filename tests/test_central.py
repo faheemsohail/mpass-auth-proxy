@@ -58,11 +58,27 @@ def allow(monkeypatch):
 
 
 @pytest.fixture
-def stub():
+def stub_key_file(tmp_path):
+    return tmp_path / "stub-key.pem"
+
+
+@pytest.fixture
+def stub(stub_key_file):
     return TestClient(stub_mpass_idp.create_app(
         issuer=m.OIDC_ISSUER_URL,
         allowed_redirects=[f"{ISSUER}/", "https://portal.example.com/"],
+        key_file=str(stub_key_file),
     ))
+
+
+@pytest.fixture
+def idp_sign(stub, stub_key_file):
+    """Sign claims with the stub IdP's own key and kid: a token the proxy's
+    JWKS check accepts, so a test can vary exactly one claim."""
+    from cryptography.hazmat.primitives import serialization
+    key = serialization.load_pem_private_key(stub_key_file.read_bytes(), password=None)
+    kid = stub.get(urlparse(m.OIDC_ISSUER_URL).path + "/.well-known/jwks.json").json()["keys"][0]["kid"]
+    return lambda claims: jwt.encode(claims, key, algorithm="RS256", headers={"kid": kid})
 
 
 @pytest.fixture
@@ -553,6 +569,17 @@ class TestBundleModeUnchanged:
 # Config
 # ---------------------------------------------------------------------------
 
+def _rsa_b64() -> str:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    pem = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+    return base64.b64encode(pem).decode()
+
+
+_KEY_B64 = _rsa_b64()
+
+
 class TestCentralConfig:
     def test_example_file_loads(self):
         clients = m._load_clients(str(Path(m.__file__).with_name("clients.example.json")))
@@ -584,6 +611,8 @@ class TestCentralConfig:
         monkeypatch.setenv("MPASS_PROXY_ISSUER_URL", ISSUER)
         monkeypatch.setenv("OIDC_LOGOUT_URI", IDP_LOGOUT)
         monkeypatch.delenv("COOKIE_DOMAIN", raising=False)  # not needed centrally
+        monkeypatch.setenv("MPASS_SIGNING_KEY_ALLOW_EPHEMERAL", "false")
+        monkeypatch.setenv("MPASS_SIGNING_KEY_B64", _KEY_B64)
         for k, v in env.items():
             if v is None:
                 monkeypatch.delenv(k, raising=False)
@@ -605,6 +634,10 @@ class TestCentralConfig:
         {"MPASS_PROXY_ISSUER_URL": "http://mpass-auth-proxy:8000"},
         {"OIDC_LOGOUT_URI": None},
         {"SMB_CORPORATE_ID": "corp-a"},
+        # Replicas must share one key (Plan 3 §2), so the dev-only opt-in is
+        # refused centrally even when a real key is also configured.
+        {"MPASS_SIGNING_KEY_ALLOW_EPHEMERAL": "true"},
+        {"MPASS_SIGNING_KEY_ALLOW_EPHEMERAL": "true", "MPASS_SIGNING_KEY_B64": ""},
     ])
     def test_central_mode_refuses_incomplete_config(self, monkeypatch, tmp_path, env):
         with pytest.raises(RuntimeError):
@@ -683,3 +716,84 @@ def test_central_token_never_logs_the_verifier(proxy, stub, caplog):
     bad = "y" * 43
     token(proxy, code, code_verifier=bad)
     assert bad not in caplog.text and VERIFIER not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Code review of PR #11: guards a mutation showed were unpinned
+# ---------------------------------------------------------------------------
+
+def _callback_with(proxy, stub, idp_sign, id_over=None, access_over=None, drop=()):
+    """Run a real flow, then replace the IdP's tokens with copies re-signed by
+    the IdP's key with the given claim changes."""
+    cb = idp_login(stub, authorize(proxy), "alice")
+    q = {k: v[0] for k, v in parse_qs(cb.query).items()}
+    for name, over in (("id_token", id_over), ("access_token", access_over)):
+        claims = {**jwt.decode(q[name], options={"verify_signature": False}), **(over or {})}
+        q[name] = idp_sign({k: v for k, v in claims.items() if k not in drop})
+    return proxy.get(cb.path, params=q)
+
+
+class TestCallbackTokenChecks:
+    def test_unchanged_resigned_pair_accepted(self, proxy, stub, idp_sign):
+        # Control: the re-signing helper alone does not cause a refusal.
+        assert "code" in parse_qs(urlparse(_callback_with(proxy, stub, idp_sign).headers["location"]).query)
+
+    def test_id_token_for_another_audience(self, proxy, stub, idp_sign):
+        assert refused(_callback_with(proxy, stub, idp_sign, id_over={"aud": "some-other-client"}), 401)
+
+    def test_access_token_with_wrong_token_use(self, proxy, stub, idp_sign):
+        assert refused(_callback_with(proxy, stub, idp_sign, access_over={"token_use": "id"}), 401)
+
+    def test_access_token_for_another_cognito_client(self, proxy, stub, idp_sign):
+        assert refused(_callback_with(proxy, stub, idp_sign, access_over={"client_id": "other"}), 401)
+
+    def test_tokens_without_sub(self, proxy, stub, idp_sign):
+        assert refused(_callback_with(proxy, stub, idp_sign, drop=("sub",)), 401)
+
+    def test_client_deregistered_mid_flow(self, proxy, stub, monkeypatch):
+        r = authorize(proxy, FD_A)
+        cb = idp_login(stub, r, "alice")
+        monkeypatch.setattr(m, "_CLIENTS", m._parse_clients({"clients": [PORTAL]}))
+        assert refused(proxy.get(f"{cb.path}?{cb.query}"))
+
+
+class TestReviewGuards:
+    def test_basic_and_form_client_id_must_agree(self, proxy, stub):
+        code = code_of(sign_in(proxy, stub, "alice"))
+        r = token(proxy, code, how="basic", client_id="fd-a")
+        assert r.status_code == 401 and _err(r) == "invalid_client"
+
+    def test_basic_with_matching_form_client_id_accepted(self, proxy, stub):
+        code = code_of(sign_in(proxy, stub, "alice"))
+        assert token(proxy, code, how="basic", client_id=PORTAL["client_id"]).status_code == 200
+
+    @pytest.mark.parametrize("uri", [
+        "https://portal%2eexample.com/cb",
+        "https://portal.example.com%40evil.com/cb",
+    ])
+    def test_percent_in_authority(self, uri):
+        assert m._strict_redirect_uri_ok(uri) is False
+
+    @pytest.mark.parametrize("uri", ["https://portal.example.com:abc/cb", "https://portal.example.com:99999/cb"])
+    def test_bad_port_is_a_refusal_not_a_crash(self, uri):
+        assert m._strict_redirect_uri_ok(uri) is False
+
+    def test_bad_port_at_authorize(self, proxy):
+        assert refused(authorize(proxy, redirect_uri="https://portal.example.com:abc/api/auth/mpass/callback"))
+
+    @pytest.mark.parametrize("verifier", ["short", "a" * 129, "has space" + "a" * 40, "plus+" + "a" * 40])
+    def test_verifier_outside_rfc7636_format(self, proxy, stub, verifier):
+        # The challenge matches the verifier, so only the format check refuses.
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+        code = code_of(sign_in(proxy, stub, "alice", code_challenge=challenge))
+        r = token(proxy, code, code_verifier=verifier)
+        assert r.status_code == 400 and _err(r) == "invalid_grant"
+
+    @pytest.mark.parametrize("param", ["state", "nonce"])
+    def test_overlong_state_or_nonce(self, proxy, store, param):
+        assert refused(authorize(proxy, **{param: "x" * (m.MAX_PARAM_LEN + 1)}))
+        assert store == {}
+
+    @pytest.mark.parametrize("param", ["state", "nonce"])
+    def test_state_or_nonce_at_cap_accepted(self, proxy, param):
+        assert authorize(proxy, **{param: "x" * m.MAX_PARAM_LEN}).status_code == 302

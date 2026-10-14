@@ -479,6 +479,13 @@ if _CLIENTS:
             "Central mode (CLIENTS_FILE) needs OIDC_LOGOUT_URI: /logout must end "
             "the IdP session, not only the client's."
         )
+    if _EPHEMERAL_SIGNING_KEY_ALLOWED:
+        raise RuntimeError(
+            "MPASS_SIGNING_KEY_ALLOW_EPHEMERAL is set, and central mode "
+            "(CLIENTS_FILE) refuses it: every replica must sign with the one key "
+            "the clients verify against. Unset it and configure "
+            "MPASS_SIGNING_KEY_B64 or the MPASS_SIGNING_KEY_GCP_* pair."
+        )
     if SMB_CORPORATE_ID:
         raise RuntimeError(
             "SMB_CORPORATE_ID is ignored in central mode (CLIENTS_FILE); each "
@@ -1222,6 +1229,8 @@ CENTRAL_TOKEN_TTL: int = 3600
 # window to tokens minted while the victim's flow is open; the real fix needs
 # the hosted login to round-trip state or a nonce (FOSS-616).
 FLOW_TOKEN_SKEW: int = 60
+# state and nonce are echoed back and stored in Redis; bound what a caller can park there.
+MAX_PARAM_LEN: int = 512
 _PKCE_S256_CHALLENGE = re.compile(r"[A-Za-z0-9_-]{43}")
 _PKCE_VERIFIER = re.compile(r"[A-Za-z0-9._~-]{43,128}")
 _COPIED_ID_CLAIMS = ("sub", "email", "cognito:username")
@@ -1283,6 +1292,8 @@ async def _central_authorize(request: Request) -> Response:
         return _refuse("pkce_required", client_id)
     if not q.get("state"):
         return _refuse("state_required", client_id)
+    if len(q["state"]) > MAX_PARAM_LEN or len(q.get("nonce", "")) > MAX_PARAM_LEN:
+        return _refuse("param_too_long", client_id)
 
     flow_id = secrets.token_urlsafe(32)
     await redis_client.setex(f"central_flow:{flow_id}", BRIDGE_STATE_TTL, json.dumps({
@@ -1320,7 +1331,7 @@ async def _central_callback_impl(request: Request) -> Response:
     client_id = flow["client_id"]
     client = _CLIENTS.get(client_id)
     if client is None or flow["redirect_uri"] not in client["redirect_uris"]:
-        return _refuse("unknown_client", client_id)  # deregistered mid-flow
+        return _refuse("unknown_client", client_id)  # deregistered mid-flow (a config reload; Fleet later)
 
     id_token = request.query_params.get("id_token", "")
     access_token = request.query_params.get("access_token", "")
