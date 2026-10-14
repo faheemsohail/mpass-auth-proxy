@@ -1216,6 +1216,12 @@ async def _handle_refresh_token(refresh_token: str) -> Response:
 FLOW_COOKIE = "__Host-mpass_flow"
 LOGOUT_COOKIE = "__Host-mpass_logout"
 CENTRAL_TOKEN_TTL: int = 3600
+# Stopgap against a login swap (the IdP leg carries no state, so a captured
+# /mpass-callback URL could complete someone else's flow): Cognito tokens must be
+# minted after the flow began, allowing this much clock skew. It narrows the
+# window to tokens minted while the victim's flow is open; the real fix needs
+# the hosted login to round-trip state or a nonce (FOSS-616).
+FLOW_TOKEN_SKEW: int = 60
 _PKCE_S256_CHALLENGE = re.compile(r"[A-Za-z0-9_-]{43}")
 _PKCE_VERIFIER = re.compile(r"[A-Za-z0-9._~-]{43,128}")
 _COPIED_ID_CLAIMS = ("sub", "email", "cognito:username")
@@ -1252,8 +1258,15 @@ async def _verify_idp_jwt(token: str, **decode_kw) -> dict:
     )
 
 
-def _sign(claims: dict) -> str:
-    return jwt.encode(claims, _SIGNING_PRIVATE_KEY, algorithm="RS256", headers={"kid": _SIGNING_KID})
+def _sign(claims: dict, typ: str = "JWT") -> str:
+    # typ separates our two tokens (RFC 9068: access tokens are at+jwt), so a
+    # verifier can refuse an access token presented as an id_token.
+    return jwt.encode(claims, _SIGNING_PRIVATE_KEY, algorithm="RS256", headers={"kid": _SIGNING_KID, "typ": typ})
+
+
+def _minted_during_flow(claims: dict, created_at: int) -> bool:
+    iat = claims.get("iat")
+    return type(iat) is int and iat >= created_at - FLOW_TOKEN_SKEW
 
 
 async def _central_authorize(request: Request) -> Response:
@@ -1278,6 +1291,7 @@ async def _central_authorize(request: Request) -> Response:
         "state": q["state"],
         "code_challenge": q["code_challenge"],
         "nonce": q.get("nonce", ""),
+        "created_at": int(time.time()),
     }))
     logger.info("central: authorize client_id=%r", client_id)
     response = RedirectResponse(url=_moneta_login_url(), status_code=302)
@@ -1332,6 +1346,8 @@ async def _central_callback_impl(request: Request) -> Response:
         or access.get("sub") != id_claims.get("sub")
     ):
         return _refuse("invalid_token", client_id, 401)
+    if not (_minted_during_flow(id_claims, flow["created_at"]) and _minted_during_flow(access, flow["created_at"])):
+        return _refuse("tokens_predate_flow", client_id, 401)
 
     binding = client["smb_binding"]
     reason = ""
@@ -1434,7 +1450,7 @@ async def _central_token(request: Request) -> Response:
     if data["nonce"]:
         id_claims["nonce"] = data["nonce"]
     body = {
-        "access_token": _sign({**base, "token_use": "access"}),
+        "access_token": _sign({**base, "token_use": "access"}, typ="at+jwt"),
         "id_token": _sign(id_claims),
         "token_type": "Bearer",
         "expires_in": CENTRAL_TOKEN_TTL,

@@ -609,3 +609,77 @@ class TestCentralConfig:
     def test_central_mode_refuses_incomplete_config(self, monkeypatch, tmp_path, env):
         with pytest.raises(RuntimeError):
             self._import(monkeypatch, tmp_path, **env)
+
+
+# ---------------------------------------------------------------------------
+# Security review of PR #11
+# ---------------------------------------------------------------------------
+
+class TestLoginSwap:
+    """The IdP leg carries no state, so a captured /mpass-callback URL (the
+    attacker's own token pair) could complete a victim's unfinished flow. The
+    stopgap: tokens minted before the flow began, beyond clock skew, are refused."""
+
+    def test_captured_callback_refused_in_a_later_flow(self, proxy, stub, monkeypatch, store):
+        attacker_cb = idp_login(stub, authorize(proxy), "bob")   # attacker signs in, keeps the URL
+        proxy.cookies.clear()
+        later = m.time.time() + m.FLOW_TOKEN_SKEW + 5
+        monkeypatch.setattr(m.time, "time", lambda: later)
+        authorize(proxy)                                          # victim starts a flow
+        r = proxy.get(f"{attacker_cb.path}?{attacker_cb.query}")  # ...and follows the link
+        assert refused(r, 401)
+        assert not any(k.startswith("central_code:") for k in store)
+
+    def test_tokens_within_skew_accepted(self, proxy, stub, monkeypatch):
+        # The proxy's clock runs ahead of the IdP's by just under the skew, so
+        # honest tokens look slightly older than the flow.
+        real = m.time.time
+        monkeypatch.setattr(m.time, "time", lambda: real() + m.FLOW_TOKEN_SKEW - 5)
+        r = authorize(proxy)
+        monkeypatch.setattr(m.time, "time", real)
+        cb = idp_login(stub, r, "alice")
+        assert "code" in parse_qs(urlparse(proxy.get(f"{cb.path}?{cb.query}").headers["location"]).query)
+
+    @pytest.mark.parametrize("iat,ok", [
+        (None, False), ("1000", False), (True, False),
+        (1000 - 61, False), (1000 - 60, True), (1000, True), (2000, True),
+    ])
+    def test_iat_rule(self, iat, ok, monkeypatch):
+        monkeypatch.setattr(m, "FLOW_TOKEN_SKEW", 60)
+        claims = {} if iat is None else {"iat": iat}
+        assert m._minted_during_flow(claims, 1000) is ok
+
+    def test_flow_records_creation_time(self, proxy, store):
+        before = int(m.time.time())
+        authorize(proxy)
+        (ttl, raw), = store.values()
+        assert before <= json.loads(raw)["created_at"] <= int(m.time.time())
+
+    def test_stub_hosted_login_echoes_nothing_to_bind_to(self, proxy, stub):
+        """No flow binding is possible today: the hosted login takes only
+        client_id and client_redirect_url, and returns no state or nonce. The
+        real fix needs mPass to round-trip one (FOSS-616)."""
+        login = urlparse(authorize(proxy, nonce="n-1").headers["location"])
+        assert set(parse_qs(login.query)) == {"client_id", "client_redirect_url"}
+        q = parse_qs(login.query)
+        r = stub.get("/users/login/as", params={"user": "alice", "client_id": q["client_id"][0],
+                     "client_redirect_url": q["client_redirect_url"][0], "state": "s", "nonce": "n"},
+                     follow_redirects=False)
+        back = parse_qs(urlparse(r.headers["location"]).query)
+        assert set(back) == {"id_token", "access_token", "refresh_token"}
+        assert "nonce" not in jwt.decode(back["id_token"][0], options={"verify_signature": False})
+
+
+class TestTokenTypes:
+    def test_access_token_is_typed_at_jwt(self, proxy, stub):
+        body = token(proxy, code_of(sign_in(proxy, stub, "alice"))).json()
+        assert jwt.get_unverified_header(body["access_token"])["typ"] == "at+jwt"
+        assert jwt.get_unverified_header(body["id_token"])["typ"] == "JWT"
+
+
+def test_central_token_never_logs_the_verifier(proxy, stub, caplog):
+    caplog.set_level("DEBUG")
+    code = code_of(sign_in(proxy, stub, "alice"))
+    bad = "y" * 43
+    token(proxy, code, code_verifier=bad)
+    assert bad not in caplog.text and VERIFIER not in caplog.text

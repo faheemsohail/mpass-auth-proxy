@@ -83,7 +83,7 @@ Each client entry has exactly these keys:
 | Key | |
 |---|---|
 | `client_id` | unique |
-| `secret_sha256` | list of lowercase hex `sha256(secret)`; two during a rotation |
+| `secret_sha256` | list of lowercase hex `sha256(secret)`; two during a rotation. Generate each secret with `openssl rand -hex 32` and store `printf %s "$SECRET" \| sha256sum`. An unsalted sha256 is safe only for a high-entropy random secret: never register a hash of a chosen password. The hash cannot reveal the secret's length, so this is not checked at startup |
 | `redirect_uris` | non-empty list, matched exactly |
 | `post_logout_redirect_uris` | list (may be empty), matched exactly |
 | `smb_binding` | `null` (no corporate check; e.g. the portal, which checks the claims itself) or the `custom:corporate_id` every user must carry |
@@ -98,7 +98,7 @@ segments (also percent-encoded).
 | Method, path | Parameters | Refusals |
 |---|---|---|
 | `GET /authorize` | `client_id`, `redirect_uri`, `state`, `code_challenge`, `code_challenge_method=S256`, optional `nonce` | 400, no redirect: unknown `client_id`; `redirect_uri` failing the strict parse or not byte-equal to a registered one; method absent (= `plain`) or not `S256`; challenge not 43 base64url chars; no `state` |
-| `GET /mpass-callback` | from the IdP | 400 page, no redirect: no `__Host-mpass_flow` cookie, or the flow expired (600 s) or was used. 401: an id or access token failing verification, or the two for different users. 502: no access token, or the IdP JWKS unreachable. A user outside the client's `smb_binding` is redirected to the client's `redirect_uri` with `error=access_denied`, `error_description=not_corporate\|wrong_organization` and `state` (RFC 6749 §4.1.2.1). Success: `redirect_uri?code=…&state=…` |
+| `GET /mpass-callback` | from the IdP | 400 page, no redirect: no `__Host-mpass_flow` cookie, or the flow expired (600 s) or was used. 401: an id or access token failing verification, the two for different users, or either minted (`iat`) more than 60 s before the flow began (see "Login swap" below). 502: no access token, or the IdP JWKS unreachable. A user outside the client's `smb_binding` is redirected to the client's `redirect_uri` with `error=access_denied`, `error_description=not_corporate\|wrong_organization` and `state` (RFC 6749 §4.1.2.1). Success: `redirect_uri?code=…&state=…` |
 | `POST /token` | form: `grant_type=authorization_code`, `code`, `code_verifier`, `redirect_uri`; client auth by `client_secret_basic` **or** `client_secret_post` | 401 `invalid_client`: no, unknown or wrong credentials. 400 `invalid_request`: both auth methods. 400 `unsupported_grant_type`: anything but `authorization_code` (refresh is FOSS-611). 400 `invalid_grant`: unknown, used or expired (60 s) code; code issued to another client; `redirect_uri` not equal to the one at `/authorize`; bad verifier. Any presented code is burned, even on refusal |
 | `GET /.well-known/openid-configuration` | | |
 | `GET /.well-known/jwks.json` | | |
@@ -106,13 +106,27 @@ segments (also percent-encoded).
 | `GET /signed-out` | `__Host-mpass_logout` cookie | without a valid cookie: a "signed out" page, no redirect |
 
 `/token` success returns `id_token` and `access_token`, both RS256 JWTs signed
-by this service (`kid` in the JWKS) with `iss` = `MPASS_PROXY_ISSUER_URL`,
+by this service (`kid` in the JWKS; header `typ` is `JWT` for the id_token and
+`at+jwt` for the access token, RFC 9068, so a verifier can tell them apart) with `iss` = `MPASS_PROXY_ISSUER_URL`,
 `aud` = the `client_id`, a 3600 s lifetime, `token_use` = `id` or `access`, and
 the verified `sub`, `email`, `cognito:username`, `custom:is_corporate` and
 `custom:corporate_id` (the last two from the verified Cognito access token;
 absent if Cognito sent none), plus `nonce` in the id_token if one was sent. No
 Cognito token is returned or stored. `expires_in` is 3600; there is no
 `refresh_token`.
+
+**Login swap: a stopgap only.** The hosted login takes only `client_id` and
+`client_redirect_url` and returns no `state` or `nonce`, so the IdP leg cannot be
+bound to the browser's flow. A victim with an unfinished flow who follows an
+attacker's captured `/mpass-callback?id_token=…&access_token=…` URL would be
+signed in as the attacker. The proxy refuses Cognito tokens minted more than
+`FLOW_TOKEN_SKEW` (60 s) before the flow began, which leaves the window open
+only for tokens minted while the victim's flow is open. The real fix needs mPass
+to round-trip `state` or a `nonce` (asked under FOSS-616).
+
+**`GET /logout` has no CSRF protection**, as is usual for OIDC RP-initiated
+logout: any page can sign a user out, but it can only send them to a registered
+`post_logout_redirect_uri`.
 
 `/mpass/login` and `/mpass/logout` answer 404 in central mode. The flow cookie
 is `__Host-mpass_flow` (host-only, `Secure`, `HttpOnly`, `SameSite=Lax`), keyed
