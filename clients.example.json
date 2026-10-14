@@ -1,0 +1,11 @@
+{
+  "clients": [
+    {
+      "client_id": "foss-portal-sandbox",
+      "secret_sha256": ["0000000000000000000000000000000000000000000000000000000000000000"],
+      "redirect_uris": ["https://foss-portal.8-233-59-78.sslip.io/api/auth/mpass/callback"],
+      "post_logout_redirect_uris": ["https://foss-portal.8-233-59-78.sslip.io/"],
+      "smb_binding": null
+    }
+  ]
+}

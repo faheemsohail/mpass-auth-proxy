@@ -84,8 +84,8 @@ verification, the `SMB_CORPORATE_ID` check (bob and ivan refused when set to
 - The synthetic `email` of real mPass users (`cognito:default_val`) is not imitated;
   the stub sends a plausible address.
 - Discovery has no `authorization_endpoint` (the proxy never reads it), and
-  `main.py` has no discovery route of its own: its `/.well-known/jwks.json` is 404 when
-  `LAUNCHPAD_EMAIL_CAPTURE` is off (l.766-779). With capture off, oauth2-proxy must
+  in per-bundle mode `main.py` has no discovery route of its own: its `/.well-known/jwks.json` is 404 when
+  `LAUNCHPAD_EMAIL_CAPTURE` is off. Central mode (`CLIENTS_FILE`, FOSS-609) serves both. With capture off, oauth2-proxy must
   skip discovery and be given explicit login, redeem and JWKS URLs; or turn capture on.
 - `/logout` is tested directly and through `main.py`'s `/mpass/logout` redirect chain,
   but not through a real oauth2-proxy `sign_out`.
