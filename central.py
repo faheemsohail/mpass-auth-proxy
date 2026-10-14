@@ -676,6 +676,11 @@ async def _end_session(client_id: str, hint: str) -> None:
     except InvalidTokenError:
         logger.info("central: logout id_token_hint ignored client_id=%r", client_id)
         return
+    # Only an id_token: the access token carries sid too, and apps and MCP
+    # servers receive it as a bearer; it must not end the user's session.
+    if claims.get("token_use") != "id" or jwt.get_unverified_header(hint).get("typ") == "at+jwt":
+        logger.info("central: logout hint is not an id_token client_id=%r", client_id)
+        return
     sid = claims.get("sid")
     if not isinstance(sid, str) or not _SHA256_HEX.fullmatch(sid):
         return

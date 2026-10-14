@@ -189,7 +189,9 @@ Why it is built this way:
   it, and a refresh past the end is `invalid_grant`.
 - **Sign-out ends it.** `/logout?id_token_hint=<id_token>` deletes the session
   the token's `sid` names, so a copied session cookie cannot refresh after
-  sign-out. The hint must be signed by this service for that `client_id`; an
+  sign-out. The hint must be an id_token (`token_use` `id`, header `typ` not
+  `at+jwt`: the access token, which apps receive as a bearer, carries `sid`
+  too and must not end the session), signed by this service for that `client_id`; an
   expired one still counts. A missing or bad hint is ignored and the sign-out
   proceeds.
 - **The cluster's sign-out sends the hint server-side.** Each cluster sets

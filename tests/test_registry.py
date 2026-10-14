@@ -1006,3 +1006,32 @@ class TestLogoutHintNeverLogged:
             '%s - "%s %s HTTP/%s" %d', "10.0.0.1:5555", "GET", "/logout?id_token_hint=eyJSECRET.x.y", "1.1", 204)
         assert "eyJSECRET" not in caplog.text
         assert '"GET /logout HTTP/1.1" 204' in caplog.text
+
+
+class TestOnlyAnIdTokenEndsTheSession:
+    """The access token carries sid too, and is forwarded to apps and MCP
+    servers as a bearer; it must not be able to end the user's session."""
+
+    @pytest.fixture
+    def body(self, fp, stub):
+        return fd_token(fp, code_of(sign_in(fp, stub, "alice", FD1))).json()
+
+    def test_access_token_as_backend_hint(self, fp, store, body):
+        r = fp.get("/logout", params={"id_token_hint": body["access_token"]})
+        assert r.status_code == 204 and r.content == b""
+        assert rkey(body["refresh_token"]) in store
+
+    def test_access_token_as_browser_hint(self, fp, store, body):
+        r = fp.get("/logout", params={"client_id": ID1, "post_logout_redirect_uri": f"https://auth.{BASE_1}/",
+                                      "id_token_hint": body["access_token"]})
+        assert r.status_code == 302
+        assert rkey(body["refresh_token"]) in store
+
+    @pytest.mark.parametrize("typ,use", [("at+jwt", "id"), ("JWT", "access"), ("JWT", None)])
+    def test_either_marker_of_an_access_token_refuses(self, fp, store, body, typ, use):
+        claims = jwt.decode(body["id_token"], options={"verify_signature": False})
+        claims = {k: v for k, v in claims.items() if k != "token_use"}
+        if use:
+            claims["token_use"] = use
+        assert fp.get("/logout", params={"id_token_hint": c._sign(claims, typ=typ)}).status_code == 204
+        assert rkey(body["refresh_token"]) in store
