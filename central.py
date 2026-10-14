@@ -383,12 +383,12 @@ async def _central_callback_impl(request: Request) -> Response:
         client = await _lookup(client_id)
     except RegistryUnavailable:
         return _unavailable(client_id)
-    # Deregistered, suspended or changed mid-flow: a CLIENTS_FILE restart, or Fleet.
+    # Deregistered or suspended mid-flow (a CLIENTS_FILE restart, or Fleet). The
+    # binding below is checked against this fresh entry, not the flow's copy.
     if (
         client is None
         or _inactive(client)
         or flow["redirect_uri"] not in client["redirect_uris"]
-        or flow.get("smb_id") != client["smb_binding"]
     ):
         return _refuse("unknown_client", client_id)
 

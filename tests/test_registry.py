@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse, Response
 import central as c
 import main as m
 from tests.test_central import (  # noqa: F401  (fixtures are used by name)
-    ISSUER, PORTAL, _sha, allow, authorize, code_of, idp_login, proxy, proxy_key,
+    ISSUER, PORTAL, _sha, allow, authorize, code_of, idp_login, idp_sign, proxy, proxy_key,
     refused, sign_in, store, stub, stub_key_file, token,
 )
 
@@ -146,7 +146,8 @@ class TestAuthorize:
 
     def test_no_base_domain_refused(self, fp, fleet):
         fleet.add(base=None)
-        assert refused(authorize(fp, FD1))
+        r = authorize(fp, FD1)
+        assert refused(r) and "no_base_domain" in r.text  # its own outcome, not a redirect mismatch
 
     @pytest.mark.parametrize("uri", [
         "https://evil.com/oauth2/callback",
@@ -239,6 +240,19 @@ class TestCallbackBinding:
         # ivan has no corporate_id claim; a missing binding must not equal a missing claim.
         fleet.add(smb=None)
         assert location_q(sign_in(fp, stub, "ivan", FD1))["error"] == ["access_denied"]
+
+    @pytest.mark.parametrize("smb", [None, ""])
+    def test_no_smb_does_not_match_an_empty_corporate_id(self, fp, fleet, stub, idp_sign, smb):
+        # A corporate user whose corporate_id claim is "" must not match an
+        # entry with no SMB: the binding fails closed, it is not an equality.
+        fleet.add(smb=smb)
+        cb = idp_login(stub, authorize(fp, FD1), "alice")
+        q = {k: v[0] for k, v in parse_qs(cb.query).items()}
+        for name in ("id_token", "access_token"):
+            claims = jwt.decode(q[name], options={"verify_signature": False})
+            q[name] = idp_sign({**claims, "custom:corporate_id": ""})
+        r = fp.get(cb.path, params=q)
+        assert location_q(r)["error"] == ["access_denied"]
 
     def test_suspended_mid_flow(self, fp, fleet, stub, store):
         r = authorize(fp, FD1)
