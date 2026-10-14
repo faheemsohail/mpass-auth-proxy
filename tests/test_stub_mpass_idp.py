@@ -1,10 +1,12 @@
-"""fake-mpass (dev/fake-mpass) driven end to end by the real proxy in main.py.
+"""stub-mpass-idp (dev/stub-mpass-idp) driven end to end by the real proxy in main.py.
 
-In-process only: main's httpx calls are routed into the fake via ASGITransport,
+In-process only: main's httpx calls are routed into the stub via ASGITransport,
 so nothing binds a port.
 """
 import os
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from html import unescape
@@ -16,8 +18,8 @@ import pytest
 from fastapi.testclient import TestClient
 from jwt import PyJWK
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "dev" / "fake-mpass"))
-import fake_mpass  # noqa: E402
+sys.path.insert(0, str(Path(__file__).parent.parent / "dev" / "stub-mpass-idp"))
+import stub_mpass_idp  # noqa: E402
 
 import main as m  # noqa: E402
 
@@ -28,25 +30,26 @@ CHALLENGE = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"  # S256(VERIFIER)
 
 @pytest.fixture(autouse=True)
 def allow(monkeypatch):
-    monkeypatch.setenv(fake_mpass.GUARD_VAR, "1")
+    monkeypatch.setenv(stub_mpass_idp.GUARD_VAR, "1")
 
 
+STUB_VAR = stub_mpass_idp.GUARD_VAR
 ALLOWED = ["https://test-auth.example.com/", "http://localhost/bye"]
 
 
 @pytest.fixture
-def fake():
-    return TestClient(fake_mpass.create_app(issuer=m.OIDC_ISSUER_URL, allowed_redirects=ALLOWED))
+def stub():
+    return TestClient(stub_mpass_idp.create_app(issuer=m.OIDC_ISSUER_URL, allowed_redirects=ALLOWED))
 
 
 @pytest.fixture
-def proxy(monkeypatch, fake):
-    """The real proxy, with its IdP/JWKS traffic and Redis pointed at the fake."""
-    fake_app = fake.app
+def proxy(monkeypatch, stub):
+    """The real proxy, with its IdP/JWKS traffic and Redis pointed at the stub."""
+    stub_app = stub.app
     real_client = httpx.AsyncClient
     monkeypatch.setattr(
         m.httpx, "AsyncClient",
-        lambda **kw: real_client(transport=httpx.ASGITransport(app=fake_app), **kw),
+        lambda **kw: real_client(transport=httpx.ASGITransport(app=stub_app), **kw),
     )
     store: dict = {}
 
@@ -67,8 +70,8 @@ def proxy(monkeypatch, fake):
     return TestClient(m.app, follow_redirects=False)
 
 
-def sign_in(proxy, fake, user, state="s1"):
-    """/authorize -> fake login -> /mpass-callback. Returns the callback response."""
+def sign_in(proxy, stub, user, state="s1"):
+    """/authorize -> stub login -> /mpass-callback. Returns the callback response."""
     r = proxy.get("/authorize", params={
         "state": state, "redirect_uri": CALLBACK,
         "code_challenge": CHALLENGE, "code_challenge_method": "S256",
@@ -76,9 +79,9 @@ def sign_in(proxy, fake, user, state="s1"):
     assert r.status_code == 302
     login = urlparse(r.headers["location"])
     assert login.path == "/users/login"
-    page = fake.get(f"{login.path}?{login.query}")
+    page = stub.get(f"{login.path}?{login.query}")
     href = next(unescape(h) for h in re.findall(r'href="([^"]+)"', page.text) if f"user={user}&" in unescape(h))
-    r = fake.get(href, follow_redirects=False)
+    r = stub.get(href, follow_redirects=False)
     cb = urlparse(r.headers["location"])
     assert f"{cb.scheme}://{cb.netloc}{cb.path}" == m.MPASS_CALLBACK_URL
     return proxy.get(f"{cb.path}?{cb.query}", cookies={"mpass_bridge": state})
@@ -94,92 +97,92 @@ def exchange(proxy, callback_resp):
 @pytest.mark.parametrize("value", [None, "", "0", "true", "TRUE", " 1"])
 def test_guard_refuses_without_ack(monkeypatch, value):
     if value is None:
-        monkeypatch.delenv(fake_mpass.GUARD_VAR)
+        monkeypatch.delenv(stub_mpass_idp.GUARD_VAR)
     else:
-        monkeypatch.setenv(fake_mpass.GUARD_VAR, value)
+        monkeypatch.setenv(stub_mpass_idp.GUARD_VAR, value)
     with pytest.raises(RuntimeError, match="refuses to start"):
-        fake_mpass.create_app(issuer=m.OIDC_ISSUER_URL)
+        stub_mpass_idp.create_app(issuer=m.OIDC_ISSUER_URL)
 
 
-def test_discovery_and_jwks(fake):
+def test_discovery_and_jwks(stub):
     base = urlparse(m.OIDC_ISSUER_URL).path
-    disc = fake.get(f"{base}/.well-known/openid-configuration").json()
+    disc = stub.get(f"{base}/.well-known/openid-configuration").json()
     assert disc["issuer"] == m.EXPECTED_ISSUER
     u = urlparse(m.OIDC_ISSUER_URL)
     assert disc["token_endpoint"] == f"{u.scheme}://{u.netloc}/oauth2/token"
-    assert fake.get(f"{base}/.well-known/jwks.json").json()["keys"][0]["alg"] == "RS256"
+    assert stub.get(f"{base}/.well-known/jwks.json").json()["keys"][0]["alg"] == "RS256"
 
 
 def test_key_file_gives_stable_kid(tmp_path):
     kf = str(tmp_path / "k.pem")
-    kid = lambda: TestClient(fake_mpass.create_app(issuer="http://x/p", key_file=kf)).get(
+    kid = lambda: TestClient(stub_mpass_idp.create_app(issuer="http://x/p", key_file=kf)).get(
         "/p/.well-known/jwks.json").json()["keys"][0]["kid"]
     assert kid() == kid()
 
 
-def test_full_flow_issues_verifiable_tokens(proxy, fake):
-    cb = sign_in(proxy, fake, "alice")
+def test_full_flow_issues_verifiable_tokens(proxy, stub):
+    cb = sign_in(proxy, stub, "alice")
     assert cb.status_code == 302 and cb.headers["location"].startswith(CALLBACK)
     tok = exchange(proxy, cb).json()
-    # access_token is the fake's, verified against the fake's JWKS.
-    key = PyJWK.from_dict(fake.get(urlparse(m.OIDC_ISSUER_URL).path + "/.well-known/jwks.json").json()["keys"][0]).key
+    # access_token is the stub's, verified against the stub's JWKS.
+    key = PyJWK.from_dict(stub.get(urlparse(m.OIDC_ISSUER_URL).path + "/.well-known/jwks.json").json()["keys"][0]).key
     access = jwt.decode(tok["access_token"], key, algorithms=["RS256"], options={"verify_aud": False}, issuer=m.EXPECTED_ISSUER)
     assert access["exp"] - access["iat"] == 3600
     assert access["username"] == "alice" and access["custom:corporate_id"] == "corp-a"
     # id_token is re-signed by the proxy (email capture on in tests/.env.test).
     ident = jwt.decode(tok["id_token"], m._SIGNING_PRIVATE_KEY.public_key(), algorithms=["RS256"], audience=m.OIDC_CLIENT_ID, options={"verify_iss": False})
     assert ident["cognito:username"] == "alice"
-    assert tok["refresh_token"].startswith(fake_mpass.REFRESH_PREFIX)
+    assert tok["refresh_token"].startswith(stub_mpass_idp.REFRESH_PREFIX)
 
 
 @pytest.mark.parametrize("user,expected_reason", [("bob", "wrong_organization"), ("ivan", "not_corporate")])
-def test_corporate_check_refuses(proxy, fake, monkeypatch, user, expected_reason):
+def test_corporate_check_refuses(proxy, stub, monkeypatch, user, expected_reason):
     monkeypatch.setattr(m, "SMB_CORPORATE_ID", "corp-a")
-    r = sign_in(proxy, fake, user)
+    r = sign_in(proxy, stub, user)
     assert "login_error=access_denied" in r.headers["location"]
     assert f"reason={expected_reason}" in r.headers["location"]
 
 
 @pytest.mark.parametrize("user", ["alice", "adam"])
-def test_corporate_check_admits_own_org(proxy, fake, monkeypatch, user):
+def test_corporate_check_admits_own_org(proxy, stub, monkeypatch, user):
     monkeypatch.setattr(m, "SMB_CORPORATE_ID", "corp-a")
-    assert sign_in(proxy, fake, user).headers["location"].startswith(CALLBACK)
+    assert sign_in(proxy, stub, user).headers["location"].startswith(CALLBACK)
 
 
-def test_refresh(proxy, fake, monkeypatch):
+def test_refresh(proxy, stub, monkeypatch):
     monkeypatch.setattr(m, "SMB_CORPORATE_ID", "corp-a")
-    tok = exchange(proxy, sign_in(proxy, fake, "adam")).json()
+    tok = exchange(proxy, sign_in(proxy, stub, "adam")).json()
     r = proxy.post("/token", data={"grant_type": "refresh_token", "refresh_token": tok["refresh_token"]})
     assert r.status_code == 200
     body = r.json()
     assert body["access_token"] and body["id_token"]
-    assert body["refresh_token"] == tok["refresh_token"]  # fake, like Cognito, does not rotate
+    assert body["refresh_token"] == tok["refresh_token"]  # stub, like Cognito, does not rotate
 
 
-def test_fake_token_endpoint_shape(fake):
-    r = fake.post("/oauth2/token", data={"grant_type": "refresh_token", "refresh_token": "fake-refresh:bob", "client_id": "c"})
+def test_stub_token_endpoint_shape(stub):
+    r = stub.post("/oauth2/token", data={"grant_type": "refresh_token", "refresh_token": "stub-refresh:bob", "client_id": "c"})
     body = r.json()
     assert "refresh_token" not in body and body["expires_in"] == 3600
-    assert fake.post("/oauth2/token", data={"grant_type": "password"}).json() == {"error": "unsupported_grant_type"}
+    assert stub.post("/oauth2/token", data={"grant_type": "password"}).json() == {"error": "unsupported_grant_type"}
 
 
 def test_refresh_refused_for_bad_token(proxy):
-    for bad in ("nope", fake_mpass.REFRESH_PREFIX + "ghost"):
+    for bad in ("nope", stub_mpass_idp.REFRESH_PREFIX + "ghost"):
         r = proxy.post("/token", data={"grant_type": "refresh_token", "refresh_token": bad})
         assert r.status_code == 400
 
 
-def test_logout_redirects_to_logout_uri(fake):
-    r = fake.get("/logout", params={"client_id": "c", "logout_uri": "http://localhost/bye"}, follow_redirects=False)
+def test_logout_redirects_to_logout_uri(stub):
+    r = stub.get("/logout", params={"client_id": "c", "logout_uri": "http://localhost/bye"}, follow_redirects=False)
     assert r.headers["location"] == "http://localhost/bye"
 
 
-def test_proxy_mpass_logout_chains_through_fake_logout(proxy, fake, monkeypatch):
-    monkeypatch.setattr(m, "OIDC_LOGOUT_URI", "http://fake.local/logout")
+def test_proxy_mpass_logout_chains_through_stub_logout(proxy, stub, monkeypatch):
+    monkeypatch.setattr(m, "OIDC_LOGOUT_URI", "http://stub.local/logout")
     monkeypatch.setattr(m, "LOGOUT_REDIRECT_URL", "http://localhost/bye")
     r = proxy.get("/mpass/logout")
     rd = unquote(parse_qs(urlparse(r.headers["location"]).query)["rd"][0])
-    r = fake.get(urlparse(rd).path + "?" + urlparse(rd).query, follow_redirects=False)
+    r = stub.get(urlparse(rd).path + "?" + urlparse(rd).query, follow_redirects=False)
     assert r.headers["location"] == "http://localhost/bye"
 
 
@@ -192,28 +195,33 @@ BAD_URLS = [
     "https://localhost/bye",
     "http://localhost/other",
     "javascript:alert(1)",
+    "https://test-auth.example.com/\\evil.com",
+    "http://localhost/bye/../evil",
+    "http://localhost/bye/%2e%2e/evil",
+    "http://localhost/bye/%2E./evil",
+    "http://localhost/bye/./x",
 ]
 
 
 @pytest.mark.parametrize("url", BAD_URLS)
-def test_disallowed_redirects_refused(fake, url):
-    r = fake.get("/users/login/as", params={"user": "alice", "client_id": "c", "client_redirect_url": url}, follow_redirects=False)
+def test_disallowed_redirects_refused(stub, url):
+    r = stub.get("/users/login/as", params={"user": "alice", "client_id": "c", "client_redirect_url": url}, follow_redirects=False)
     assert r.status_code == 400 and "location" not in r.headers
-    r = fake.get("/logout", params={"logout_uri": url}, follow_redirects=False)
+    r = stub.get("/logout", params={"logout_uri": url}, follow_redirects=False)
     assert r.status_code == 200 and "location" not in r.headers
 
 
 def test_unset_allowlist_refuses_everything(monkeypatch):
-    monkeypatch.delenv("FAKE_MPASS_ALLOWED_REDIRECTS", raising=False)
-    f = TestClient(fake_mpass.create_app(issuer="http://x/p"))
+    monkeypatch.delenv("STUB_MPASS_IDP_ALLOWED_REDIRECTS", raising=False)
+    f = TestClient(stub_mpass_idp.create_app(issuer="http://x/p"))
     r = f.get("/users/login/as", params={"user": "alice", "client_id": "c", "client_redirect_url": "http://localhost/bye"}, follow_redirects=False)
     assert r.status_code == 400
     assert "location" not in f.get("/logout", params={"logout_uri": "http://localhost/bye"}, follow_redirects=False).headers
 
 
 def test_allowlist_from_env_and_path_prefix(monkeypatch):
-    monkeypatch.setenv("FAKE_MPASS_ALLOWED_REDIRECTS", "http://a.local:9000, http://b.local/cb")
-    f = TestClient(fake_mpass.create_app(issuer="http://x/p"))
+    monkeypatch.setenv("STUB_MPASS_IDP_ALLOWED_REDIRECTS", "http://a.local:9000, http://b.local/cb")
+    f = TestClient(stub_mpass_idp.create_app(issuer="http://x/p"))
     ok = lambda u: f.get("/logout", params={"logout_uri": u}, follow_redirects=False).status_code == 302
     assert ok("http://a.local:9000/any/path?x=1") and ok("http://b.local/cb") and ok("http://b.local/cb/deep")
     assert not ok("http://b.local/cbx") and not ok("http://a.local/any")
@@ -221,8 +229,47 @@ def test_allowlist_from_env_and_path_prefix(monkeypatch):
 
 def test_key_file_is_private(tmp_path):
     kf = tmp_path / "k.pem"
-    fake_mpass.create_app(issuer="http://x/p", key_file=str(kf))
+    stub_mpass_idp.create_app(issuer="http://x/p", key_file=str(kf))
     assert kf.stat().st_mode & 0o777 == 0o600
     kf.chmod(0o644)
     with pytest.raises(RuntimeError, match="readable"):
-        fake_mpass.create_app(issuer="http://x/p", key_file=str(kf))
+        stub_mpass_idp.create_app(issuer="http://x/p", key_file=str(kf))
+
+
+def test_symlink_at_key_path_is_not_followed(tmp_path):
+    target = tmp_path / "victim"
+    link = tmp_path / "k.pem"
+    link.symlink_to(target)  # dangling: exists() is False, O_TRUNC would write through it
+    with pytest.raises(FileExistsError):
+        stub_mpass_idp.create_app(issuer="http://x/p", key_file=str(link))
+    assert not target.exists()
+
+
+SMOKE = """
+import sys
+sys.path.insert(0, sys.argv[1])
+from fastapi.testclient import TestClient
+import stub_mpass_idp
+c = TestClient(stub_mpass_idp.create_app(issuer="http://x/p", allowed_redirects=["http://x/"]))
+r = c.post("/oauth2/token", data={"grant_type": "refresh_token", "refresh_token": "stub-refresh:bob", "client_id": "c"})
+assert r.status_code == 200 and r.json()["access_token"], r.text
+assert c.get("/p/.well-known/jwks.json").json()["keys"]
+"""
+
+
+def test_runs_under_its_own_pinned_requirements():
+    """The root suite resolves fastapi/starlette from the proxy's pins; the image
+    ships dev/stub-mpass-idp/requirements.txt. Exercise form parsing and JWT
+    signing under the shipped set (needs uv; fails rather than skips in CI)."""
+    if not shutil.which("uv"):
+        if os.environ.get("CI"):
+            pytest.fail("uv is required for the own-requirements smoke test")
+        pytest.skip("uv not installed")
+    d = Path(stub_mpass_idp.__file__).parent
+    r = subprocess.run(
+        ["uv", "run", "--no-project", "--with-requirements", str(d / "requirements.txt"),
+         "--with", "httpx", "python", "-I", "-c", SMOKE, str(d)],
+        capture_output=True, text=True, timeout=300,
+        env={**os.environ, STUB_VAR: "1"},
+    )
+    assert r.returncode == 0, r.stderr

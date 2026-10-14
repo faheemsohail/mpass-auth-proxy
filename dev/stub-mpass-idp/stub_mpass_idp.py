@@ -1,4 +1,4 @@
-"""fake-mpass: LOCAL / SANDBOX stand-in for mPass's hosted login + Cognito.
+"""stub-mpass-idp: LOCAL / SANDBOX stand-in for mPass's hosted login + Cognito.
 
 Imitates only what mpass-auth-proxy's main.py calls (see README). Signs with its
 own key; never trust that key anywhere real.
@@ -10,7 +10,7 @@ import time
 import uuid
 from html import escape
 from pathlib import Path
-from urllib.parse import urlencode, urlparse
+from urllib.parse import unquote, urlencode, urlparse
 
 import jwt
 from cryptography.hazmat.primitives import serialization
@@ -20,15 +20,15 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from jwt.algorithms import RSAAlgorithm
 
 TOKEN_TTL = 3600
-REFRESH_PREFIX = "fake-refresh:"
-GUARD_VAR = "FAKE_MPASS_I_KNOW_THIS_IS_NOT_PRODUCTION"
+REFRESH_PREFIX = "stub-refresh:"
+GUARD_VAR = "STUB_MPASS_IDP_I_KNOW_THIS_IS_NOT_PRODUCTION"
 
 
 def _load_key(path: str):
     p = Path(path) if path else None
     if p and p.exists():
         if p.stat().st_mode & 0o077:
-            raise RuntimeError(f"fake-mpass: key file {p} is group/world readable; chmod 600 it")
+            raise RuntimeError(f"stub-mpass-idp: key file {p} is group/world readable; chmod 600 it")
         return serialization.load_pem_private_key(p.read_bytes(), password=None)
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     if p:
@@ -52,6 +52,10 @@ def _redirect_allowed(url: str, allowed: list[str]) -> bool:
     u = urlparse(url)
     if u.scheme not in ("http", "https") or "@" in u.netloc or not u.hostname:
         return False
+    # A browser resolves dot segments (also percent-encoded), so /cb/../evil
+    # would land outside the registered prefix.
+    if any(seg in (".", "..") for seg in unquote(u.path).split("/")):
+        return False
     for entry in allowed:
         a = urlparse(entry)
         if (a.scheme, a.netloc.lower()) != (u.scheme, u.netloc.lower()):
@@ -70,17 +74,17 @@ def create_app(
 ) -> FastAPI:
     if os.environ.get(GUARD_VAR) != "1":
         raise RuntimeError(
-            f"fake-mpass refuses to start: set {GUARD_VAR}=1. It issues tokens for "
+            f"stub-mpass-idp refuses to start: set {GUARD_VAR}=1. It issues tokens for "
             "fixed test users and must never run in production."
         )
-    issuer = (issuer or os.environ["FAKE_MPASS_ISSUER_URL"]).rstrip("/")
+    issuer = (issuer or os.environ["STUB_MPASS_IDP_ISSUER_URL"]).rstrip("/")
     users_file = users_file or os.environ.get(
-        "FAKE_MPASS_USERS_FILE", str(Path(__file__).with_name("users.json"))
+        "STUB_MPASS_IDP_USERS_FILE", str(Path(__file__).with_name("users.json"))
     )
-    key = _load_key(key_file if key_file is not None else os.environ.get("FAKE_MPASS_KEY_FILE", ""))
+    key = _load_key(key_file if key_file is not None else os.environ.get("STUB_MPASS_IDP_KEY_FILE", ""))
     if allowed_redirects is None:
         allowed_redirects = [
-            x.strip() for x in os.environ.get("FAKE_MPASS_ALLOWED_REDIRECTS", "").split(",") if x.strip()
+            x.strip() for x in os.environ.get("STUB_MPASS_IDP_ALLOWED_REDIRECTS", "").split(",") if x.strip()
         ]
     users = {u["username"]: u for u in json.loads(Path(users_file).read_text())["users"]}
 
@@ -100,7 +104,7 @@ def create_app(
     def tokens(username: str, client_id: str) -> dict:
         u = users[username]
         now = int(time.time())
-        sub = str(uuid.uuid5(uuid.NAMESPACE_URL, f"fake-mpass/{username}"))
+        sub = str(uuid.uuid5(uuid.NAMESPACE_URL, f"stub-mpass-idp/{username}"))
         # Cognito custom attributes are strings: "true"/"false", never booleans.
         custom = {"custom:is_corporate": "true" if u.get("corporate_id") and u.get("is_corporate", True) else "false"}
         if u.get("corporate_id"):
@@ -133,7 +137,7 @@ def create_app(
             f'{escape(n)}</a> &mdash; {escape(u["email"])} ({escape(u.get("corporate_id") or "individual")})</li>'
             for n, u in users.items()
         )
-        return f"<h1>fake-mpass: sign in as&hellip;</h1><p>Local/sandbox only.</p><ul>{rows}</ul>"
+        return f"<h1>stub-mpass-idp: sign in as&hellip;</h1><p>Local/sandbox only.</p><ul>{rows}</ul>"
 
     @app.get("/users/login/as")
     def login_as(user: str, client_id: str, client_redirect_url: str):
@@ -157,7 +161,7 @@ def create_app(
     @app.get("/logout")
     def logout(client_id: str = "", logout_uri: str = ""):
         if not _redirect_allowed(logout_uri, allowed_redirects):
-            return HTMLResponse("fake-mpass: signed out")
+            return HTMLResponse("stub-mpass-idp: signed out")
         return RedirectResponse(logout_uri, status_code=302)
 
     return app
