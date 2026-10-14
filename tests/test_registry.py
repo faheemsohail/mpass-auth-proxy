@@ -63,6 +63,8 @@ class FakeFleet:
         self.status: int | None = None  # answer every lookup with this status
         self.body = None           # answer every lookup with this JSON body
         self.status_body = None    # (status, JSON body) for every lookup
+        self.slow = 0.0            # simulated seconds before Fleet answers
+        self.idp_new_rt = None     # make the IdP's refresh reply carry a new refresh token
         self.app = FastAPI()
 
         @self.app.get("/internal/auth/clients/{client_id}")
@@ -100,10 +102,20 @@ class Route(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request):
         if request.url.host != FLEET_HOST:
-            return await self.stub.handle_async_request(request)
+            resp = await self.stub.handle_async_request(request)
+            if self.fleet.idp_new_rt and request.url.path == "/oauth2/token" and resp.status_code == 200:
+                await resp.aread()  # Cognito with rotation on: a new refresh token in the reply
+                body = {**json.loads(resp.content), "refresh_token": self.fleet.idp_new_rt}
+                return httpx.Response(200, json=body)
+            return resp
         self.fleet.calls += 1
         if self.fleet.down:
             raise httpx.ConnectError("connection refused", request=request)
+        # ASGITransport enforces no timeout, so a slow Fleet is simulated: it
+        # answers after `slow` seconds, and the caller's own read timeout (the
+        # one httpx put on the request) cuts it off first if it is shorter.
+        if self.fleet.slow and self.fleet.slow >= (request.extensions.get("timeout", {}).get("read") or 1e9):
+            raise httpx.ReadTimeout("read timed out", request=request)
         return await self.fleet_t.handle_async_request(request)
 
 
@@ -295,6 +307,17 @@ class TestCallbackBinding:
         assert refused(fp.get(f"{cb.path}?{cb.query}"))
         assert not any(k.startswith("central_code:") for k in store)
 
+    @pytest.mark.parametrize("change", [{"scheme": "http"}, {"base": BASE_2}])
+    def test_redirect_changed_mid_flow(self, fp, fleet, stub, store, change):
+        # The flow's redirect_uri was right at /authorize; Fleet's answer at the
+        # callback no longer yields it, so no code goes there.
+        r = authorize(fp, FD1)
+        cb = idp_login(stub, r, "alice")
+        fleet.add(**change)
+        c._registry_cache.clear()
+        assert refused(fp.get(f"{cb.path}?{cb.query}"))
+        assert not any(k.startswith("central_code:") for k in store)
+
     def test_decommissioned_mid_flow(self, fp, fleet, stub):
         r = authorize(fp, FD1)
         cb = idp_login(stub, r, "alice")
@@ -466,6 +489,17 @@ class TestCache:
     def test_timeout_is_bounded(self):
         assert 0 < c.REGISTRY_TIMEOUT <= 5
 
+    def test_a_slow_fleet_is_cut_off(self, fp, fleet):
+        # Slower than REGISTRY_TIMEOUT, faster than httpx's 5 s default: only
+        # the timeout this service sets cuts it off.
+        fleet.slow = 4.0
+        r = authorize(fp, FD1)
+        assert r.status_code == 503 and "location" not in r.headers
+
+    def test_a_fleet_inside_the_timeout_answers(self, fp, fleet):
+        fleet.slow = 2.0
+        assert authorize(fp, FD1).status_code == 302
+
 
 # ---------------------------------------------------------------------------
 # Per-bundle mode and config
@@ -623,6 +657,14 @@ class TestRefresh:
         r = refresh(fp, handle)
         assert r.status_code == 503 and r.json()["error"] == "temporarily_unavailable"
         assert rkey(handle) in store  # could not ask is not no
+
+    def test_cognito_rotation_is_stored_not_returned(self, fp, fleet, store, handle):
+        fleet.idp_new_rt = "stub-rotated-rt"
+        r = refresh(fp, handle)
+        assert r.status_code == 200 and "stub-rotated-rt" not in r.text
+        assert r.json()["refresh_token"] == handle
+        _, raw = store[rkey(handle)]
+        assert json.loads(raw)["idp_refresh_token"] == "stub-rotated-rt"
 
     def test_static_client_refresh_keeps_its_rule(self, fp, stub):
         from tests.test_central import PORTAL_SECRET
