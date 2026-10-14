@@ -797,3 +797,12 @@ class TestReviewGuards:
     @pytest.mark.parametrize("param", ["state", "nonce"])
     def test_state_or_nonce_at_cap_accepted(self, proxy, param):
         assert authorize(proxy, **{param: "x" * m.MAX_PARAM_LEN}).status_code == 302
+
+
+@pytest.mark.parametrize("which", ["id", "access"])
+def test_each_token_must_postdate_the_flow(proxy, stub, idp_sign, which):
+    """Either token alone, minted before the flow began, is refused: an attacker
+    could otherwise pair one stale captured token with one fresh one."""
+    old = {"iat": int(m.time.time()) - m.FLOW_TOKEN_SKEW - 30}
+    r = _callback_with(proxy, stub, idp_sign, **{f"{which}_over": old})
+    assert refused(r, 401)

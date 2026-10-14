@@ -1226,7 +1226,8 @@ CENTRAL_TOKEN_TTL: int = 3600
 # Stopgap against a login swap (the IdP leg carries no state, so a captured
 # /mpass-callback URL could complete someone else's flow): Cognito tokens must be
 # minted after the flow began, allowing this much clock skew. It narrows the
-# window to tokens minted while the victim's flow is open; the real fix needs
+# window to tokens minted from FLOW_TOKEN_SKEW before the flow opens until it
+# closes (up to BRIDGE_STATE_TTL); the real fix needs
 # the hosted login to round-trip state or a nonce (FOSS-616).
 FLOW_TOKEN_SKEW: int = 60
 # state and nonce are echoed back and stored in Redis; bound what a caller can park there.
@@ -1331,7 +1332,7 @@ async def _central_callback_impl(request: Request) -> Response:
     client_id = flow["client_id"]
     client = _CLIENTS.get(client_id)
     if client is None or flow["redirect_uri"] not in client["redirect_uris"]:
-        return _refuse("unknown_client", client_id)  # deregistered mid-flow (a config reload; Fleet later)
+        return _refuse("unknown_client", client_id)  # deregistered mid-flow (a restart with a new CLIENTS_FILE; Fleet later)
 
     id_token = request.query_params.get("id_token", "")
     access_token = request.query_params.get("access_token", "")

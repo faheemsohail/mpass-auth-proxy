@@ -121,8 +121,8 @@ Cognito token is returned or stored. `expires_in` is 3600; there is no
 bound to the browser's flow. A victim with an unfinished flow who follows an
 attacker's captured `/mpass-callback?id_token=…&access_token=…` URL would be
 signed in as the attacker. The proxy refuses Cognito tokens minted more than
-`FLOW_TOKEN_SKEW` (60 s) before the flow began, which leaves the window open
-only for tokens minted while the victim's flow is open. The real fix needs mPass
+`FLOW_TOKEN_SKEW` (60 s) before the flow began. The residual window is tokens
+minted from 60 s before the victim's flow opens until it closes (up to 600 s). The real fix needs mPass
 to round-trip `state` or a `nonce` (asked under FOSS-616).
 
 **`GET /logout` has no CSRF protection**, as is usual for OIDC RP-initiated
