@@ -21,6 +21,7 @@ from jwt import PyJWK
 sys.path.insert(0, str(Path(__file__).parent.parent / "dev" / "stub-mpass-idp"))
 import stub_mpass_idp  # noqa: E402
 
+import central as c  # noqa: E402
 import main as m  # noqa: E402
 
 ISSUER = "https://test-auth.example.com"
@@ -105,7 +106,7 @@ def proxy(monkeypatch, stub, store):
     monkeypatch.setattr(m, "redis_client", Redis())
     monkeypatch.setattr(m, "_jwks_cache", None)
     monkeypatch.setattr(m, "_token_endpoint_cache", None)
-    monkeypatch.setattr(m, "_CLIENTS", m._parse_clients({"clients": [PORTAL, FD_A]}))
+    monkeypatch.setattr(m, "_CLIENTS", c._parse_clients({"clients": [PORTAL, FD_A]}))
     monkeypatch.setattr(m, "MPASS_PROXY_ISSUER_URL", ISSUER)
     monkeypatch.setattr(m, "OIDC_LOGOUT_URI", IDP_LOGOUT)
     return TestClient(m.app, base_url=ISSUER, follow_redirects=False)
@@ -217,9 +218,9 @@ class TestAuthorizeRefusals:
     def test_strict_parse_refuses_even_if_registered(self, uri):
         # The exact match alone would let a bad URI through if one were ever
         # registered; the parse is applied on its own, and at config load.
-        assert not m._strict_redirect_uri_ok(uri)
+        assert not c._strict_redirect_uri_ok(uri)
         with pytest.raises(RuntimeError):
-            m._parse_clients({"clients": [{**PORTAL, "redirect_uris": [uri]}]})
+            c._parse_clients({"clients": [{**PORTAL, "redirect_uris": [uri]}]})
 
     def test_missing_code_challenge(self, proxy):
         assert refused(authorize(proxy, code_challenge=None))
@@ -582,7 +583,7 @@ _KEY_B64 = _rsa_b64()
 
 class TestCentralConfig:
     def test_example_file_loads(self):
-        clients = m._load_clients(str(Path(m.__file__).with_name("clients.example.json")))
+        clients = c._load_clients(str(Path(c.__file__).with_name("clients.example.json")))
         assert clients["foss-portal-sandbox"]["smb_binding"] is None
 
     @pytest.mark.parametrize("bad", [
@@ -601,7 +602,7 @@ class TestCentralConfig:
     ])
     def test_bad_config_refuses_to_start(self, bad):
         with pytest.raises(RuntimeError):
-            m._parse_clients(bad)
+            c._parse_clients(bad)
 
     def _import(self, monkeypatch, tmp_path, **env):
         import importlib
@@ -656,7 +657,7 @@ class TestLoginSwap:
     def test_captured_callback_refused_in_a_later_flow(self, proxy, stub, monkeypatch, store):
         attacker_cb = idp_login(stub, authorize(proxy), "bob")   # attacker signs in, keeps the URL
         proxy.cookies.clear()
-        later = m.time.time() + m.FLOW_TOKEN_SKEW + 5
+        later = m.time.time() + c.FLOW_TOKEN_SKEW + 5
         monkeypatch.setattr(m.time, "time", lambda: later)
         authorize(proxy)                                          # victim starts a flow
         r = proxy.get(f"{attacker_cb.path}?{attacker_cb.query}")  # ...and follows the link
@@ -667,7 +668,7 @@ class TestLoginSwap:
         # The proxy's clock runs ahead of the IdP's by just under the skew, so
         # honest tokens look slightly older than the flow.
         real = m.time.time
-        monkeypatch.setattr(m.time, "time", lambda: real() + m.FLOW_TOKEN_SKEW - 5)
+        monkeypatch.setattr(m.time, "time", lambda: real() + c.FLOW_TOKEN_SKEW - 5)
         r = authorize(proxy)
         monkeypatch.setattr(m.time, "time", real)
         cb = idp_login(stub, r, "alice")
@@ -678,9 +679,9 @@ class TestLoginSwap:
         (1000 - 61, False), (1000 - 60, True), (1000, True), (2000, True),
     ])
     def test_iat_rule(self, iat, ok, monkeypatch):
-        monkeypatch.setattr(m, "FLOW_TOKEN_SKEW", 60)
+        monkeypatch.setattr(c, "FLOW_TOKEN_SKEW", 60)
         claims = {} if iat is None else {"iat": iat}
-        assert m._minted_during_flow(claims, 1000) is ok
+        assert c._minted_during_flow(claims, 1000) is ok
 
     def test_flow_records_creation_time(self, proxy, store):
         before = int(m.time.time())
@@ -753,7 +754,7 @@ class TestCallbackTokenChecks:
     def test_client_deregistered_mid_flow(self, proxy, stub, monkeypatch):
         r = authorize(proxy, FD_A)
         cb = idp_login(stub, r, "alice")
-        monkeypatch.setattr(m, "_CLIENTS", m._parse_clients({"clients": [PORTAL]}))
+        monkeypatch.setattr(m, "_CLIENTS", c._parse_clients({"clients": [PORTAL]}))
         assert refused(proxy.get(f"{cb.path}?{cb.query}"))
 
 
@@ -772,11 +773,11 @@ class TestReviewGuards:
         "https://portal.example.com%40evil.com/cb",
     ])
     def test_percent_in_authority(self, uri):
-        assert m._strict_redirect_uri_ok(uri) is False
+        assert c._strict_redirect_uri_ok(uri) is False
 
     @pytest.mark.parametrize("uri", ["https://portal.example.com:abc/cb", "https://portal.example.com:99999/cb"])
     def test_bad_port_is_a_refusal_not_a_crash(self, uri):
-        assert m._strict_redirect_uri_ok(uri) is False
+        assert c._strict_redirect_uri_ok(uri) is False
 
     def test_bad_port_at_authorize(self, proxy):
         assert refused(authorize(proxy, redirect_uri="https://portal.example.com:abc/api/auth/mpass/callback"))
@@ -791,18 +792,18 @@ class TestReviewGuards:
 
     @pytest.mark.parametrize("param", ["state", "nonce"])
     def test_overlong_state_or_nonce(self, proxy, store, param):
-        assert refused(authorize(proxy, **{param: "x" * (m.MAX_PARAM_LEN + 1)}))
+        assert refused(authorize(proxy, **{param: "x" * (c.MAX_PARAM_LEN + 1)}))
         assert store == {}
 
     @pytest.mark.parametrize("param", ["state", "nonce"])
     def test_state_or_nonce_at_cap_accepted(self, proxy, param):
-        assert authorize(proxy, **{param: "x" * m.MAX_PARAM_LEN}).status_code == 302
+        assert authorize(proxy, **{param: "x" * c.MAX_PARAM_LEN}).status_code == 302
 
 
 @pytest.mark.parametrize("which", ["id", "access"])
 def test_each_token_must_postdate_the_flow(proxy, stub, idp_sign, which):
     """Either token alone, minted before the flow began, is refused: an attacker
     could otherwise pair one stale captured token with one fresh one."""
-    old = {"iat": int(m.time.time()) - m.FLOW_TOKEN_SKEW - 30}
+    old = {"iat": int(m.time.time()) - c.FLOW_TOKEN_SKEW - 30}
     r = _callback_with(proxy, stub, idp_sign, **{f"{which}_over": old})
     assert refused(r, 401)
