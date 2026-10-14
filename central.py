@@ -28,6 +28,22 @@ from starlette.requests import Request
 logger = logging.getLogger("main")
 router = APIRouter()
 
+
+class _DropQueryString(logging.Filter):
+    """uvicorn's access line prints the request path WITH its query string, and
+    /logout?id_token_hint=, /mpass-callback?id_token= and /authorize carry
+    bearer tokens or state there. The Dockerfile's --no-access-log is the first
+    guard; this keeps the path and drops the query if that flag is ever lost."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str):
+            record.args = (*args[:2], args[2].split("?", 1)[0], *args[3:])
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_DropQueryString())
+
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 _CLIENT_KEYS = {"client_id", "secret_sha256", "redirect_uris", "post_logout_redirect_uris", "smb_binding"}
 

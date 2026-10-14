@@ -979,3 +979,30 @@ class TestBackendLogout:
         assert r.status_code == 302
         assert refused(fp.get("/logout", params={"post_logout_redirect_uri": f"https://auth.{BASE_1}/"}))
         assert refused(fp.get("/logout", params={"client_id": ID1}))
+
+
+class TestLogoutHintNeverLogged:
+    """The hint is a bearer id_token. Nothing this service logs may carry it:
+    not our own lines, and not uvicorn's access line, which prints the path
+    WITH its query string (uvicorn.protocols.utils.get_path_with_query_string).
+    The Dockerfile's --no-access-log is the first guard; this is the second."""
+
+    def test_our_logs_never_carry_the_hint(self, fp, stub, caplog):
+        caplog.set_level(logging.DEBUG)
+        body = fd_token(fp, code_of(sign_in(fp, stub, "alice", FD1))).json()
+        hint = body["id_token"]
+        fp.get("/logout", params={"id_token_hint": hint})
+        fp.get("/logout", params={"id_token_hint": hint + "x"})
+        fp.get("/logout", params={"client_id": ID1, "post_logout_redirect_uri": f"https://auth.{BASE_1}/",
+                                  "id_token_hint": hint})
+        # "httpx" is the test's own client logging the URL it sent, not this service.
+        server = [r.getMessage() for r in caplog.records if r.name != "httpx"]
+        assert server and not any(hint in line for line in server)
+
+    def test_uvicorn_access_line_drops_the_query(self, caplog):
+        caplog.set_level(logging.INFO, logger="uvicorn.access")
+        # Exactly uvicorn 0.32.1's call (protocols/http/h11_impl.py).
+        logging.getLogger("uvicorn.access").info(
+            '%s - "%s %s HTTP/%s" %d', "10.0.0.1:5555", "GET", "/logout?id_token_hint=eyJSECRET.x.y", "1.1", 204)
+        assert "eyJSECRET" not in caplog.text
+        assert '"GET /logout HTTP/1.1" 204' in caplog.text

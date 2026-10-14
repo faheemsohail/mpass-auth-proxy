@@ -202,6 +202,11 @@ Why it is built this way:
   be a static or `fd-<uuid>` client, the session is deleted as above (no
   registry call, so this works while Fleet is down), and the answer is always
   **204, no redirect**, for any hint, valid or not, so it is no oracle.
+- **The hint is never logged.** This service logs the `client_id` and `sub`,
+  never the hint. uvicorn's access line prints the path with its query string;
+  the Dockerfile's `--no-access-log` turns it off, and a filter on the
+  `uvicorn.access` logger drops the query from every access line in case that
+  flag is ever lost.
 - **Accepted cost:** the handles live only in Redis (Valkey). Losing it ends
   every central session at its next refresh (oauth2-proxy refreshes every
   3000 s), and users sign in again.
