@@ -97,25 +97,35 @@ segments (also percent-encoded).
 (Fleet's base URL) and `FLEET_BROKER_TOKEN` (a token that can only read the
 registry route), both or neither; either one without `CLIENTS_FILE` refuses
 startup. A `client_id` found in `CLIENTS_FILE` is never sent to Fleet. Ids
-matching `fd-[A-Za-z0-9-]{1,64}` are looked up at
-`GET <FLEET_REGISTRY_URL>/internal/auth/clients/{client_id}` (Plan 3 §4.1:
-`client_id`, `smb_id`, `base_domain`, `scheme`, `state`, `secret_sha256` as a
-list or one string); anything else is unknown.
+matching Fleet's pattern `fd-<lower-case uuid>` are looked up at
+`GET <FLEET_REGISTRY_URL>/internal/auth/clients/{client_id}`; any other id is
+unknown and never sent. The route's contract is foss-fleet-provisioning
+`contracts/FOSS-611.openapi.yaml` (frozen at `9fc7f75`); a copy is in
+`tests/contracts/`, and the tests validate every fake-Fleet reply against it,
+so a contract change this proxy has not followed fails the build.
 
 | Fleet answers | The proxy |
 |---|---|
-| 200, `state: active` | caches it for 30 s per `client_id` |
-| 200, any other `state` | refuses `/authorize` (400, no redirect), the callback, and `/token` (`unauthorized_client`) |
-| 404 | unknown client; not cached, and it evicts a cached entry |
-| unreachable, any other status, or a reply off the shape | "could not ask": serves the last real 200 for up to 10 min after Fleet gave it, then 503 "sign-in temporarily unavailable"; never 400 or `invalid_client`. Logs `broker.registry_unavailable`. One attempt per request, 3 s timeout |
+| 200 on the contract, `state: active` | caches it for 30 s per `client_id` |
+| 200 on the contract, `state: suspended` | refuses `/authorize` (400, no redirect), the callback, and `/token` (`unauthorized_client`), refresh included |
+| 404 `{"error": "unknown_client"}` or `{"error": "no_base_domain"}` | "no": 400, no redirect. Never cached, and it evicts a cached entry. The reason is logged, not branched on |
+| anything else: unreachable, a timeout, 401, 503 (Fleet's broker token unset), other 5xx, a 404 without the contract's body (e.g. a wrong `FLEET_REGISTRY_URL`), or a 200 off the schema (a bare-string hash, three hashes, `null` fields, an unknown `state` or `scheme`) | "could not ask": serves the last real 200 for up to 10 min after Fleet gave it, then 503 "sign-in temporarily unavailable"; never 400 or `invalid_client`. Logs `broker.registry_unavailable`. One attempt per request, 3 s timeout |
 
 A Fleet client's only redirect URI is `<scheme>://auth.<base_domain>/oauth2/callback`
-(what Fleet sets as `OAUTH2_PROXY_REDIRECT_URL`), matched exactly after the
-strict parse; `base_domain` must be a plain lowercase DNS name and `scheme`
-`https` or `http`. An entry with no `base_domain` is refused at `/authorize`.
-Its `smb_id` is the binding, compared verbatim with `custom:corporate_id`; an
-entry with no `smb_id` admits no one. `<app>-mcp.<base>` redirect hosts and
-`/logout` for Fleet clients are not supported yet.
+(what Fleet sets as `OAUTH2_PROXY_REDIRECT_URL`), and its only
+post-logout URI is `<scheme>://auth.<base_domain>/`; both are matched exactly,
+after the strict parse. A `base_domain` that is not a plain lower-case DNS name
+yields neither, so every request is refused. Its `smb_id` is the binding,
+compared verbatim with `custom:corporate_id`; an empty `smb_id` admits no one.
+`<app>-mcp.<base>` redirect hosts are not supported (FOSS-623, FOSS-624).
+
+**`/logout` is an exact match on purpose.** Each cluster's oauth2-proxy
+whitelists this service's host so its sign-out can send the browser here
+(FOSS-607 §3.3). That is safe only while `/logout` redirects nowhere but a
+`post_logout_redirect_uri` equal to the registry's; a prefix or host match would
+make every cluster an open redirect. `/signed-out` re-checks the cookie's
+destination against the registry, and redirects nowhere if Fleet cannot be
+asked. A suspended deployment may still sign out.
 
 **Endpoints.** A refusal marked *400, no redirect* is a plain response with no
 `Location`: the request is not trusted enough to choose a destination.
@@ -127,7 +137,7 @@ entry with no `smb_id` admits no one. `<app>-mcp.<base>` redirect hosts and
 | `POST /token` | form: `grant_type=authorization_code`, `code`, `code_verifier`, `redirect_uri`, or `grant_type=refresh_token`, `refresh_token`; client auth by `client_secret_basic` **or** `client_secret_post` | 401 `invalid_client`: no, unknown or wrong credentials. 503 `temporarily_unavailable`: Fleet could not be asked (see above). 400 `unauthorized_client`: a Fleet client that is not active. 400 `invalid_request`: both auth methods. 400 `unsupported_grant_type`: anything else. 400 `invalid_grant`: unknown, used or expired (60 s) code; code issued to another client; `redirect_uri` not equal to the one at `/authorize`; a verifier outside RFC 7636's format, or one not matching the challenge. Client authentication runs first: a request with bad credentials leaves the code untouched, but once the client authenticates, the presented code is consumed even if the redemption is then refused |
 | `GET /.well-known/openid-configuration` | | |
 | `GET /.well-known/jwks.json` | | |
-| `GET /logout` | `client_id`, `post_logout_redirect_uri` | 400, no redirect: unknown client, or a URI not exactly in its `post_logout_redirect_uris`. Success: 302 to the IdP sign-out, which returns to `/signed-out`, which re-checks and returns to the URI |
+| `GET /logout` | `client_id`, `post_logout_redirect_uri` | 400, no redirect: unknown client, or a URI not exactly in its `post_logout_redirect_uris`. 503: Fleet could not be asked. Success: 302 to the IdP sign-out, which returns to `/signed-out`, which re-checks and returns to the URI |
 | `GET /signed-out` | `__Host-mpass_logout` cookie | without a valid cookie: a "signed out" page, no redirect |
 
 `/token` success returns `id_token` and `access_token`, both RS256 JWTs signed
@@ -141,19 +151,33 @@ absent if Cognito sent none), plus `nonce` in the id_token if one was sent.
 
 **Refresh (FOSS-611).** When Cognito sent a refresh token, `/token` returns a
 `refresh_token` that is an opaque handle: Redis `central_refresh:{handle}`
-holds the client_id, the `sub` and the Cognito refresh token, which never
-leaves this service. The handle is not rotated (a repeated refresh succeeds),
-and each refresh renews its TTL of `SESSION_COOKIE_MAX_AGE_SECONDS`. A refresh
+holds the client_id, the `sub` and the Cognito refresh token. A refresh
 authenticates the client (which must be active), requires the handle to be
 that client's, refreshes at Cognito with the central client (and
-`OIDC_CLIENT_SECRET`), verifies both new tokens for the same `sub`, and
-re-checks the client's corporate binding; it returns newly signed tokens and
-the same handle. 400 `invalid_grant`: unknown handle, another client's handle,
-Cognito answers `invalid_grant`, or the tokens are for another user. 403
-`access_denied`: the user fails the binding. Those refusals delete the handle.
-503 `temporarily_unavailable`: Cognito unreachable, any other Cognito error
-(e.g. `invalid_client`, our misconfiguration), or an unverifiable reply; the
-handle is kept. Losing Redis ends every session at its next refresh.
+`OIDC_CLIENT_SECRET`), verifies both new tokens for the same `sub`, re-checks
+the client's corporate binding, and returns newly signed tokens (`aud` = the
+client) and the same handle.
+
+| Answer | Handle |
+|---|---|
+| 400 `invalid_grant`: unknown handle, another client's handle, Cognito answers `invalid_grant`, or the tokens are for another user | deleted (except another client's: it stays its owner's) |
+| 403 `access_denied`: the user fails the binding | deleted |
+| 503 `temporarily_unavailable`: Cognito unreachable, any other Cognito error (e.g. `invalid_client`, our own misconfiguration), or an unverifiable reply | kept: "could not ask" is not "no" |
+
+Why it is built this way:
+
+- **No Cognito token leaves Moneta.** Clusters receive only tokens this service
+  signed, and a handle that means nothing to Cognito.
+- **The handle is bound to one client** because redeeming it needs that
+  client's secret and the handle must be that client's. A handle stolen from
+  deployment X is useless at Y, and useless at X without X's secret.
+- **Not rotated.** oauth2-proxy can refresh one session concurrently, and a
+  rotating handle would log the user out on the second delivery. A replayed
+  refresh therefore succeeds. Each refresh renews the TTL
+  (`SESSION_COOKIE_MAX_AGE_SECONDS`).
+- **Accepted cost:** the handles live only in Redis (Valkey). Losing it ends
+  every central session at its next refresh (oauth2-proxy refreshes every
+  3000 s), and users sign in again.
 
 **Login swap: a stopgap only.** The hosted login takes only `client_id` and
 `client_redirect_url` and returns no `state` or `nonce`, so the IdP leg cannot be

@@ -1,0 +1,208 @@
+components:
+  schemas:
+    AuthClientNotFound:
+      description: 'The 404 body. Both reasons mean the same thing to the broker --
+        refuse, 400, no redirect,
+
+        never cached -- and are split only so its log says which (two facts, two values).'
+      properties:
+        error:
+          description: "`unknown_client`: no such client -- an id not of the form\
+            \ `fd-<canonical lower-case uuid>`, no such deployment, a decommissioned\
+            \ one (the row is deleted with it), or a deployment that never had a sign-in\
+            \ client (no `auth_client` row). `no_base_domain`: the client exists but\
+            \ its deployment has no usable base domain, so no `redirect_uri` could\
+            \ ever be valid (Plan 3 \xA74.2 rule 3). Neither is cached by the broker,\
+            \ so a base domain filled in later works at once."
+          enum:
+          - unknown_client
+          - no_base_domain
+          title: Error
+          type: string
+      required:
+      - error
+      title: AuthClientNotFound
+      type: object
+    AuthClientOut:
+      description: 'One deployment''s sign-in client. Every field is read from Fleet''s
+        rows at request time;
+
+        nothing here is echoed from the request except what the path already named.'
+      properties:
+        base_domain:
+          description: "Never null on a 200: a deployment with no usable base domain\
+            \ is a 404 (`no_base_domain`). The broker accepts a `redirect_uri` host\
+            \ only as `<label>.<base_domain>` (Plan 3 \xA74.2)."
+          title: Base Domain
+          type: string
+        client_id:
+          description: "`fd-<deployment id>`. Derived, never stored (FOSS-607 \xA7\
+            4)."
+          pattern: ^fd-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+          title: Client Id
+          type: string
+        deployment_id:
+          description: The deployment this client belongs to (a UUID).
+          title: Deployment Id
+          type: string
+        scheme:
+          description: 'The scheme of `auth.<base_domain>`, evaluated NOW by the rule
+            the apps'' Ingresses use (`apps.signin_route`, i.e. `apps._gates`). The
+            cluster''s own redirect URL was fixed at connect (FOSS-607 H1, accepted):
+            where the two differ, the broker refuses the mismatching `redirect_uri`
+            until the deployment re-connects.'
+          enum:
+          - http
+          - https
+          title: Scheme
+          type: string
+        secret_sha256:
+          description: Hashes of the secrets the broker accepts at `/token`, compared
+            with `hmac.compare_digest(sha256(presented), h)` against each. Exactly
+            ONE today (a re-connect replaces it). A list so overlap rotation (two
+            entries) needs no shape change; a broker must accept any listed hash.
+          items:
+            description: Lower-case hex sha256 of a raw client secret. The raw secret
+              is never stored.
+            pattern: ^[0-9a-f]{64}$
+            type: string
+          maxItems: 2
+          minItems: 1
+          title: Secret Sha256
+          type: array
+        smb_id:
+          description: "The deployment's SMB, which is the mPass `custom:corporate_id`\
+            \ verbatim (Plan 3 \xA76, decided 2026-10-13). The broker's corporate\
+            \ check is an equality test against this."
+          title: Smb Id
+          type: string
+        state:
+          description: '`active` exactly when `deployment.state = ''active''` (the
+            same predicate as /connect''s redemption guard); every other stored value
+            is `suspended`. The broker refuses `/authorize` and every refresh for
+            `suspended`.'
+          enum:
+          - active
+          - suspended
+          title: State
+          type: string
+      required:
+      - client_id
+      - deployment_id
+      - smb_id
+      - base_domain
+      - scheme
+      - state
+      - secret_sha256
+      title: AuthClientOut
+      type: object
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          title: Detail
+          type: array
+      title: HTTPValidationError
+      type: object
+    ValidationError:
+      properties:
+        ctx:
+          title: Context
+          type: object
+        input:
+          title: Input
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          title: Location
+          type: array
+        msg:
+          title: Message
+          type: string
+        type:
+          title: Error Type
+          type: string
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError
+      type: object
+  securitySchemes:
+    BrokerToken:
+      description: 'The broker''s own bearer token (`Authorization: Bearer <FLEET_BROKER_TOKEN>`),
+        accepted on this route only.'
+      in: header
+      name: Authorization
+      type: apiKey
+info:
+  description: "The central mpass-auth-proxy's read of Fleet: is `client_id` a live\
+    \ deployment, which hosts may it redirect to, and which secret hashes may redeem\
+    \ its codes.\n\n* **One route**, `GET /internal/auth/clients/{client_id}`, on\
+    \ its own token (`FLEET_BROKER_TOKEN`), which opens nothing else; neither `INTERNAL_API_TOKEN`\
+    \ nor the admin token opens it. Unset, the route is a 503, and Fleet refuses to\
+    \ start with `FLEET_SIGNIN_ISSUER_URL` set but no broker token.\n* **Pulled, not\
+    \ pushed** (Plan 3 \xA74.1): Fleet stays the one source of truth, and a decommission\
+    \ is visible within the broker's 30 s cache.\n* **Hashes only.** Fleet never stores\
+    \ or serves a raw client secret.\n\nInterfaces only \u2014 no bodies/logic."
+  title: "FOSS Fleet Provisioning \u2014 FOSS-611 sign-in client registry (contract)"
+  version: 0.611.0
+openapi: 3.1.0
+paths:
+  /internal/auth/clients/{client_id}:
+    get:
+      description: 'Read-only, no side effects, safe to poll. One indexed read: `auth_client`
+        by primary key,
+
+        joined to `deployment` and the SMB''s `domain_name` row (the shape `apps._gates`
+        reads).
+
+        `Cache-Control: no-store` -- the broker owns caching.'
+      operationId: auth_client_internal_auth_clients__client_id__get
+      parameters:
+      - description: '`fd-<deployment id>`. Any other value is a 404 `unknown_client`:
+          the parameter is a plain string, so the 422 FastAPI declares by default
+          is unreachable. The broker''s decision table is 200, 404, or could-not-ask.'
+        in: path
+        name: client_id
+        required: true
+        schema:
+          description: '`fd-<deployment id>`. Any other value is a 404 `unknown_client`:
+            the parameter is a plain string, so the 422 FastAPI declares by default
+            is unreachable. The broker''s decision table is 200, 404, or could-not-ask.'
+          title: Client Id
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthClientOut'
+          description: Successful Response
+        '401':
+          description: Bad or missing broker token. Could-not-ask for the broker,
+            never 'unknown client'.
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthClientNotFound'
+          description: Unknown or decommissioned client, or a deployment with no usable
+            base domain. The broker refuses and does not cache.
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+        '503':
+          description: FLEET_BROKER_TOKEN is not configured on Fleet (ruling b). Could-not-ask
+            for the broker, never 'unknown client'.
+      security:
+      - BrokerToken: []
+      summary: One deployment's sign-in client, for the central broker
+      tags:
+      - auth-clients

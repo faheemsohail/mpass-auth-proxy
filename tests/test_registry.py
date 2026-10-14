@@ -6,11 +6,14 @@ same in-process transport as dev/stub-mpass-idp. Nothing binds a port.
 """
 import json
 import logging
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import httpx
+import jsonschema
 import jwt
 import pytest
+import yaml
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
@@ -25,11 +28,29 @@ FLEET_HOST = "fleet.test"
 BROKER_TOKEN = "broker-token-for-tests"
 SECRET_1, SECRET_2 = "fd-1-secret-0123456789", "fd-2-secret-0123456789"
 BASE_1, BASE_2 = "d1.foss.example.net", "d2.foss.example.net"
-FD1 = {"client_id": "fd-1111", "redirect_uris": [f"https://auth.{BASE_1}/oauth2/callback"]}
-FD2 = {"client_id": "fd-2222", "redirect_uris": [f"https://auth.{BASE_2}/oauth2/callback"]}
+ID1, ID2, ID9 = "fd-11111111-1111-4111-8111-111111111111", "fd-22222222-2222-4222-8222-222222222222", "fd-99999999-9999-4999-8999-999999999999"
+FD1 = {"client_id": ID1, "redirect_uris": [f"https://auth.{BASE_1}/oauth2/callback"]}
+FD2 = {"client_id": ID2, "redirect_uris": [f"https://auth.{BASE_2}/oauth2/callback"]}
 
 
-def entry(cid="fd-1111", smb="corp-a", base=BASE_1, scheme="https", state="active", secret=SECRET_1):
+CONTRACT = yaml.safe_load((Path(__file__).parent / "contracts" / "FOSS-611.openapi.yaml").read_text())
+
+
+def schema_errors(doc, name):
+    """Validation errors of doc against the frozen contract's schema `name`."""
+    schema = {**CONTRACT["components"]["schemas"][name], "components": CONTRACT["components"]}
+    return list(jsonschema.Draft202012Validator(schema).iter_errors(doc))
+
+
+def contract_ok(resp, name):
+    """The honest fake Fleet only serves what the frozen contract allows, so a
+    contract change that this proxy has not followed breaks the build here."""
+    errors = schema_errors(json.loads(resp.body), name)
+    assert not errors, f"fake Fleet drifted from contracts/FOSS-611: {errors[0].message}"
+    return resp
+
+
+def entry(cid=ID1, smb="corp-a", base=BASE_1, scheme="https", state="active", secret=SECRET_1):
     return {"client_id": cid, "deployment_id": cid[3:], "smb_id": smb, "base_domain": base,
             "scheme": scheme, "state": state, "secret_sha256": [_sha(secret)]}
 
@@ -41,6 +62,7 @@ class FakeFleet:
         self.down = False          # connection refused
         self.status: int | None = None  # answer every lookup with this status
         self.body = None           # answer every lookup with this JSON body
+        self.status_body = None    # (status, JSON body) for every lookup
         self.app = FastAPI()
 
         @self.app.get("/internal/auth/clients/{client_id}")
@@ -49,10 +71,16 @@ class FakeFleet:
                 return Response(status_code=401)
             if self.status:
                 return Response(status_code=self.status)
+            if self.status_body:
+                return JSONResponse(self.status_body[1], status_code=self.status_body[0])
             if self.body is not None:
                 return JSONResponse(self.body)
             e = self.entries.get(client_id)
-            return JSONResponse(e) if e else JSONResponse({"detail": "not found"}, status_code=404)
+            if e is None:
+                return contract_ok(JSONResponse({"error": "unknown_client"}, status_code=404), "AuthClientNotFound")
+            if e == "no_base_domain":
+                return contract_ok(JSONResponse({"error": e}, status_code=404), "AuthClientNotFound")
+            return contract_ok(JSONResponse(e), "AuthClientOut")
 
         @self.app.post("/idp-token/{error}")
         def idp_token(error: str):  # an IdP token endpoint that answers with an OAuth error
@@ -83,7 +111,7 @@ class Route(httpx.AsyncBaseTransport):
 def fleet():
     f = FakeFleet()
     f.add()
-    f.add(cid="fd-2222", base=BASE_2, smb="corp-b", secret=SECRET_2)
+    f.add(cid=ID2, base=BASE_2, smb="corp-b", secret=SECRET_2)
     return f
 
 
@@ -125,13 +153,13 @@ class TestAuthorize:
         assert r.headers["location"].startswith(m.MONETA_HOSTED_UI_URL)
         (ttl, raw), = store.values()
         flow = json.loads(raw)
-        assert flow["client_id"] == "fd-1111"
+        assert flow["client_id"] == ID1
         assert flow["redirect_uri"] == FD1["redirect_uris"][0]
         assert flow["smb_id"] == "corp-a"
         assert flow["code_challenge"]
 
     def test_unknown_fd_client(self, fp, fleet, store):
-        assert refused(authorize(fp, FD1, client_id="fd-9999"))
+        assert refused(authorize(fp, FD1, client_id=ID9))
         assert fleet.calls == 1 and store == {}
 
     def test_suspended(self, fp, fleet, store):
@@ -139,15 +167,24 @@ class TestAuthorize:
         assert refused(authorize(fp, FD1))
         assert store == {}
 
-    @pytest.mark.parametrize("state", ["", "decommissioned", None])
-    def test_any_state_but_active_refused(self, fp, fleet, state):
-        fleet.entries["fd-1111"]["state"] = state
-        assert refused(authorize(fp, FD1))
-
-    def test_no_base_domain_refused(self, fp, fleet):
-        fleet.add(base=None)
+    @pytest.mark.parametrize("over", [
+        {"state": "decommissioned"}, {"state": ""}, {"state": None},
+        {"scheme": "ftp"}, {"scheme": "HTTPS"}, {"scheme": None},
+        {"base_domain": None}, {"smb_id": None}, {"deployment_id": None},
+    ])
+    def test_values_off_the_contract_are_could_not_ask(self, fp, fleet, over):
+        fleet.body = {**entry(), **over}
+        assert schema_errors(fleet.body, "AuthClientOut")  # really off the contract
         r = authorize(fp, FD1)
-        assert refused(r) and "no_base_domain" in r.text  # its own outcome, not a redirect mismatch
+        assert r.status_code == 503 and "location" not in r.headers
+
+    def test_no_base_domain_is_a_404_and_refused(self, fp, fleet, caplog):
+        caplog.set_level(logging.INFO)
+        fleet.entries[ID1] = "no_base_domain"
+        assert refused(authorize(fp, FD1))
+        assert "reason=no_base_domain" in caplog.text
+        fleet.add()  # a base domain filled in later works at once: not cached
+        assert authorize(fp, FD1).status_code == 302
 
     @pytest.mark.parametrize("uri", [
         "https://evil.com/oauth2/callback",
@@ -185,24 +222,20 @@ class TestAuthorize:
         fleet.add(base=base)
         assert refused(authorize(fp, FD1, redirect_uri=f"https://auth.{base}/oauth2/callback"))
 
-    @pytest.mark.parametrize("scheme", ["ftp", "HTTPS", "", None])
-    def test_unknown_scheme_refused(self, fp, fleet, scheme):
-        fleet.add(scheme=scheme)
-        assert refused(authorize(fp, FD1))
-        assert refused(authorize(fp, FD1, redirect_uri=f"{scheme}://auth.{BASE_1}/oauth2/callback"))
-
     def test_static_client_never_sent_to_fleet(self, fp, fleet):
         fleet.entries["foss-portal-sandbox"] = entry(cid="foss-portal-sandbox")
         assert authorize(fp, PORTAL).status_code == 302
         assert fleet.calls == 0
 
-    @pytest.mark.parametrize("cid", ["not-fd", "fd-", "fd-../../x", "fd-a/b", "fd-" + "a" * 65])
+    @pytest.mark.parametrize("cid", [
+        "not-fd", "fd-", "fd-../../x", "fd-a/b", "fd-1111", ID1.upper(), ID1 + "0", ID1[:-1], ID1 + "\n",
+    ])
     def test_non_fleet_ids_never_sent_to_fleet(self, fp, fleet, cid):
         assert refused(authorize(fp, FD1, client_id=cid))
         assert fleet.calls == 0
 
     def test_fleet_entry_for_another_client_id_is_not_trusted(self, fp, fleet):
-        fleet.entries["fd-1111"] = entry(cid="fd-2222", base=BASE_1)
+        fleet.entries[ID1] = entry(cid=ID2, base=BASE_1)
         r = authorize(fp, FD1)
         assert r.status_code == 503 and "location" not in r.headers
 
@@ -229,7 +262,7 @@ class TestCallbackBinding:
         fleet.add(smb=smb)
         assert location_q(sign_in(fp, stub, "alice", FD1))["error"] == ["access_denied"]
 
-    @pytest.mark.parametrize("smb", [None, ""])
+    @pytest.mark.parametrize("smb", [""])
     def test_entry_without_smb_fails_closed(self, fp, fleet, stub, store, smb):
         fleet.add(smb=smb)
         q = location_q(sign_in(fp, stub, "alice", FD1))
@@ -238,10 +271,10 @@ class TestCallbackBinding:
 
     def test_individual_user_with_no_corporate_id_on_unbound_entry_fails_closed(self, fp, fleet, stub):
         # ivan has no corporate_id claim; a missing binding must not equal a missing claim.
-        fleet.add(smb=None)
+        fleet.add(smb="")
         assert location_q(sign_in(fp, stub, "ivan", FD1))["error"] == ["access_denied"]
 
-    @pytest.mark.parametrize("smb", [None, ""])
+    @pytest.mark.parametrize("smb", [""])
     def test_no_smb_does_not_match_an_empty_corporate_id(self, fp, fleet, stub, idp_sign, smb):
         # A corporate user whose corporate_id claim is "" must not match an
         # entry with no SMB: the binding fails closed, it is not an equality.
@@ -265,7 +298,7 @@ class TestCallbackBinding:
     def test_decommissioned_mid_flow(self, fp, fleet, stub):
         r = authorize(fp, FD1)
         cb = idp_login(stub, r, "alice")
-        del fleet.entries["fd-1111"]
+        del fleet.entries[ID1]
         c._registry_cache.clear()
         assert refused(fp.get(f"{cb.path}?{cb.query}"))
 
@@ -288,7 +321,7 @@ class TestToken:
         r = fd_token(fp, code)
         assert r.status_code == 200, r.text
         claims = jwt.decode(r.json()["id_token"], proxy_key(fp), algorithms=["RS256"],
-                            audience="fd-1111", issuer=ISSUER)
+                            audience=ID1, issuer=ISSUER)
         assert claims["custom:corporate_id"] == "corp-a"
 
     @pytest.mark.parametrize("how", ["basic", "post"])
@@ -315,18 +348,23 @@ class TestToken:
         assert r.status_code == 400 and r.json()["error"] == "unauthorized_client"
 
     def test_unknown_client(self, fp, fleet, code):
-        del fleet.entries["fd-1111"]
+        del fleet.entries[ID1]
         c._registry_cache.clear()
         assert fd_token(fp, code).status_code == 401
 
     def test_rotation_list_of_two(self, fp, fleet, stub):
-        fleet.entries["fd-1111"]["secret_sha256"] = [_sha("old"), _sha(SECRET_1)]
+        fleet.entries[ID1]["secret_sha256"] = [_sha("old"), _sha(SECRET_1)]
         assert fd_token(fp, code_of(sign_in(fp, stub, "alice", FD1)), secret="old").status_code == 200
 
-    def test_single_hash_as_a_string(self, fp, fleet, stub):
-        # Fleet stores one hash (design 607 §4); a bare string is accepted too.
-        fleet.entries["fd-1111"]["secret_sha256"] = _sha(SECRET_1)
-        assert fd_token(fp, code_of(sign_in(fp, stub, "alice", FD1))).status_code == 200
+    def test_drift_a_bare_string_hash_is_could_not_ask(self, fp, fleet, stub):
+        # The contract says a list. A bare string is drift: it fails the frozen
+        # schema, and the proxy answers 503 rather than guess.
+        code = code_of(sign_in(fp, stub, "alice", FD1))
+        c._registry_cache.clear()
+        fleet.body = {**entry(), "secret_sha256": _sha(SECRET_1)}
+        assert schema_errors(fleet.body, "AuthClientOut")
+        r = fd_token(fp, code)
+        assert r.status_code == 503 and r.json()["error"] == "temporarily_unavailable"
 
     def test_fleet_down_uncached_is_503_not_401(self, fp, fleet, code):
         c._registry_cache.clear()
@@ -340,9 +378,9 @@ class TestAudience:
         body = fd_token(fp, code_of(sign_in(fp, stub, "alice", FD1))).json()
         for tok in (body["id_token"], body["access_token"]):
             with pytest.raises(jwt.InvalidAudienceError):
-                jwt.decode(tok, proxy_key(fp), algorithms=["RS256"], audience="fd-2222", issuer=ISSUER)
+                jwt.decode(tok, proxy_key(fp), algorithms=["RS256"], audience=ID2, issuer=ISSUER)
             assert jwt.decode(tok, proxy_key(fp), algorithms=["RS256"],
-                              audience="fd-1111", issuer=ISSUER)["aud"] == "fd-1111"
+                              audience=ID1, issuer=ISSUER)["aud"] == ID1
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +404,7 @@ class TestCache:
         assert refused(authorize(fp, FD1))
 
     def test_negative_not_cached(self, fp, fleet):
-        del fleet.entries["fd-1111"]
+        del fleet.entries[ID1]
         assert refused(authorize(fp, FD1))
         fleet.add()
         assert authorize(fp, FD1).status_code == 302
@@ -403,19 +441,23 @@ class TestCache:
 
     def test_a_404_evicts_the_cached_positive(self, fp, fleet, clock):
         assert authorize(fp, FD1).status_code == 302
-        del fleet.entries["fd-1111"]
+        del fleet.entries[ID1]
         clock[0] += 31
         assert refused(authorize(fp, FD1))
         fleet.down = True
         assert authorize(fp, FD1).status_code == 503  # not the old positive
 
     @pytest.mark.parametrize("body", [
-        [], "x", {"client_id": "fd-1111"},
+        [], "x", {"client_id": ID1},
         {**entry(), "secret_sha256": ["not-hex"]},
         {**entry(), "secret_sha256": []},
         {**entry(), "secret_sha256": None},
+        {**entry(), "secret_sha256": _sha("x")},
+        {**entry(), "secret_sha256": [_sha("a"), _sha("b"), _sha("c")]},
+        {**entry(), "secret_sha256": [_sha("a").upper()]},
     ])
     def test_malformed_answer_is_could_not_ask_and_not_cached(self, fp, fleet, body):
+        assert schema_errors(body, "AuthClientOut")  # each one really is drift
         fleet.body = body
         r = authorize(fp, FD1)
         assert r.status_code == 503 and "location" not in r.headers
@@ -441,7 +483,7 @@ class TestBundleModeNeverAsksFleet:
                 store[k] = v
         monkeypatch.setattr(m, "redis_client", Redis())
         r = TestClient(m.app, follow_redirects=False).get("/authorize", params={
-            "client_id": "fd-1111", "state": "s", "code_challenge": "x",
+            "client_id": ID1, "state": "s", "code_challenge": "x",
             "redirect_uri": "https://test-auth.example.com/oauth2/callback"})
         assert r.status_code == 302 and calls == []
 
@@ -500,7 +542,7 @@ class TestRefresh:
         ttl, raw = store[f"central_refresh:{handle}"]
         assert ttl == m.SESSION_EXPIRES_IN
         rec = json.loads(raw)
-        assert rec["client_id"] == "fd-1111" and rec["idp_refresh_token"] == "stub-refresh:alice"
+        assert rec["client_id"] == ID1 and rec["idp_refresh_token"] == "stub-refresh:alice"
 
     def test_refresh_reissues_for_this_client(self, fp, handle):
         r = refresh(fp, handle)
@@ -508,9 +550,9 @@ class TestRefresh:
         body = r.json()
         assert body["refresh_token"] == handle
         assert "stub-refresh:" not in r.text
-        claims = jwt.decode(body["id_token"], proxy_key(fp), algorithms=["RS256"], audience="fd-1111", issuer=ISSUER)
+        claims = jwt.decode(body["id_token"], proxy_key(fp), algorithms=["RS256"], audience=ID1, issuer=ISSUER)
         assert claims["custom:corporate_id"] == "corp-a"
-        jwt.decode(body["access_token"], proxy_key(fp), algorithms=["RS256"], audience="fd-1111", issuer=ISSUER)
+        jwt.decode(body["access_token"], proxy_key(fp), algorithms=["RS256"], audience=ID1, issuer=ISSUER)
 
     def test_replay_is_idempotent(self, fp, handle):
         # Not rotated: oauth2-proxy may refresh twice concurrently, and a
@@ -537,7 +579,7 @@ class TestRefresh:
         assert r.status_code == 400 and r.json()["error"] == "unauthorized_client"
 
     def test_decommissioned(self, fp, fleet, handle):
-        del fleet.entries["fd-1111"]
+        del fleet.entries[ID1]
         c._registry_cache.clear()
         assert refresh(fp, handle).status_code == 401
 
@@ -546,7 +588,7 @@ class TestRefresh:
         fleet.down = True
         assert refresh(fp, handle).status_code == 503
 
-    @pytest.mark.parametrize("smb", ["corp-b", None, ""])
+    @pytest.mark.parametrize("smb", ["corp-b", ""])
     def test_corporate_binding_rechecked(self, fp, fleet, store, handle, smb):
         fleet.add(smb=smb)
         c._registry_cache.clear()
@@ -599,3 +641,128 @@ class TestRefresh:
         monkeypatch.setattr(m, "_get_token_endpoint", endpoint)
         assert refresh(fp, handle).status_code == 503
         assert f"central_refresh:{handle}" in store
+
+
+
+# ---------------------------------------------------------------------------
+# The frozen contract (foss-fleet-provisioning contracts/FOSS-611.openapi.yaml
+# at 9fc7f75, copied to tests/contracts/)
+# ---------------------------------------------------------------------------
+
+class TestContract:
+    def test_fixtures_are_on_the_contract(self):
+        for e in (entry(), entry(state="suspended", scheme="http", smb=""),
+                  {**entry(), "secret_sha256": [_sha("a"), _sha("b")]}):
+            assert not schema_errors(e, "AuthClientOut")
+        for reason in ("unknown_client", "no_base_domain"):
+            assert not schema_errors({"error": reason}, "AuthClientNotFound")
+
+    def test_client_id_pattern_is_the_contracts(self):
+        pattern = CONTRACT["components"]["schemas"]["AuthClientOut"]["properties"]["client_id"]["pattern"]
+        assert pattern == "^" + c._FLEET_CLIENT_ID.pattern + "$"
+
+    def test_every_valid_reply_is_accepted(self, fp, fleet):
+        for e in (entry(), {**entry(), "secret_sha256": [_sha("a"), _sha(SECRET_1)]}, {**entry(), "extra": 1}):
+            assert not schema_errors(e, "AuthClientOut")
+            fleet.entries[ID1] = e
+            c._registry_cache.clear()
+            assert authorize(fp, FD1).status_code == 302
+
+    @pytest.mark.parametrize("status", [401, 503, 500, 502])
+    def test_declared_non_answers_are_could_not_ask(self, fp, fleet, status):
+        fleet.status = status
+        r = authorize(fp, FD1)
+        assert r.status_code == 503 and "location" not in r.headers
+
+    @pytest.mark.parametrize("body", [{"detail": "Not Found"}, {"error": "gone"}, "x"])
+    def test_a_404_off_the_contract_is_could_not_ask(self, fp, fleet, body):
+        # A wrong FLEET_REGISTRY_URL also answers 404; only the contract's 404 is "no".
+        fleet.status_body = (404, body)
+        r = authorize(fp, FD1)
+        assert r.status_code == 503 and "location" not in r.headers
+
+
+# ---------------------------------------------------------------------------
+# /logout for Fleet clients. Acceptance criterion (FOSS-607 §3.3): clusters
+# whitelist this service's host for oauth2-proxy's sign-out `rd`, which is safe
+# only while post_logout_redirect_uri is an EXACT match against the registry.
+# ---------------------------------------------------------------------------
+
+class TestFleetLogout:
+    TARGET = f"https://auth.{BASE_1}/"
+
+    def logout(self, fp, client_id=ID1, target=TARGET):
+        params = {"client_id": client_id, "post_logout_redirect_uri": target}
+        return fp.get("/logout", params={k: v for k, v in params.items() if v is not None})
+
+    def test_chains_through_the_one_logout_uri_and_back(self, fp, stub):
+        r = self.logout(fp)
+        assert r.status_code == 302
+        idp = urlparse(r.headers["location"])
+        q = parse_qs(idp.query)
+        assert q["client_id"] == [m.OIDC_CLIENT_ID]
+        assert q["logout_uri"] == [f"{ISSUER}/signed-out"]
+        back = urlparse(stub.get(f"{idp.path}?{idp.query}", follow_redirects=False).headers["location"])
+        r = fp.get(back.path)
+        assert r.status_code == 302 and r.headers["location"] == self.TARGET
+
+    def test_http_deployment(self, fp, fleet):
+        fleet.add(scheme="http")
+        assert self.logout(fp, target=f"http://auth.{BASE_1}/").status_code == 302
+        assert refused(self.logout(fp))
+
+    @pytest.mark.parametrize("target", [
+        None, "",
+        f"https://auth.{BASE_1}",                    # no slash
+        f"https://auth.{BASE_1}/x",
+        f"https://auth.{BASE_1}/?rd=https://evil.com",
+        f"https://auth.{BASE_1}/#",
+        f"https://auth.{BASE_1}:443/",
+        f"http://auth.{BASE_1}/",
+        f"https://{BASE_1}/",
+        f"https://plane.{BASE_1}/",
+        f"https://auth.{BASE_2}/",                   # another deployment's
+        f"https://auth.{BASE_1}.evil.com/",
+        f"https://evil.com\\@auth.{BASE_1}/",
+        f"https://evil.com%40auth.{BASE_1}/",
+        f"https://u@auth.{BASE_1}/",
+        "https://evil.com/",
+        f"{ISSUER}/",                                # this service itself
+    ])
+    def test_post_logout_uri_must_match_exactly(self, fp, target):
+        assert refused(self.logout(fp, target=target))
+
+    def test_unknown_client(self, fp):
+        assert refused(self.logout(fp, client_id=ID9))
+
+    def test_suspended_may_still_sign_out(self, fp, fleet):
+        fleet.add(state="suspended")
+        assert self.logout(fp).status_code == 302
+
+    def test_fleet_down_uncached_is_503(self, fp, fleet):
+        fleet.down = True
+        r = self.logout(fp)
+        assert r.status_code == 503 and "location" not in r.headers
+
+    def test_signed_out_rechecks_against_the_registry(self, fp, fleet, stub):
+        r = self.logout(fp)
+        del fleet.entries[ID1]
+        c._registry_cache.clear()
+        r = fp.get("/signed-out")
+        assert r.status_code == 200 and "location" not in r.headers
+
+    def test_signed_out_refuses_a_forged_cookie(self, fp):
+        import base64
+        for target in ("https://evil.com/", f"https://auth.{BASE_2}/"):
+            val = base64.urlsafe_b64encode(json.dumps({"client_id": ID1, "uri": target}).encode()).decode()
+            fp.cookies.set("__Host-mpass_logout", val)
+            assert "location" not in fp.get("/signed-out").headers
+
+    def test_signed_out_with_fleet_down_does_not_redirect(self, fp, fleet):
+        # The cookie is the browser's to forge; with no registry answer it is
+        # never trusted for a redirect.
+        assert self.logout(fp).status_code == 302
+        c._registry_cache.clear()
+        fleet.down = True
+        r = fp.get("/signed-out")
+        assert r.status_code == 200 and "location" not in r.headers

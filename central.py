@@ -137,7 +137,9 @@ _COPIED_CORPORATE_CLAIMS = ("custom:is_corporate", "custom:corporate_id")
 REGISTRY_TTL: int = 30
 REGISTRY_STALE_MAX: int = 600
 REGISTRY_TIMEOUT: float = 3.0
-_FLEET_CLIENT_ID = re.compile(r"fd-[A-Za-z0-9-]{1,64}")
+# Fleet's own client_id pattern (contracts/FOSS-611.openapi.yaml); any other id is
+# unknown, so it is never sent.
+_FLEET_CLIENT_ID = re.compile(r"fd-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 # A lowercase DNS name of two or more labels: nothing that can carry a port,
 # userinfo, path, `\` or `%` into the redirect URI built from it.
 _HOSTNAME = re.compile(r"(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
@@ -149,30 +151,37 @@ class RegistryUnavailable(Exception):
 
 
 def _fleet_entry(client_id: str, doc) -> dict:
-    """Map a §4.1 reply onto the static-client shape. Raises ValueError on a
-    reply off that shape. A missing base_domain or an unknown scheme is not a
-    defect here: it leaves redirect_uris empty, and /authorize refuses."""
+    """Map a 200 reply (AuthClientOut, foss-fleet-provisioning
+    contracts/FOSS-611.openapi.yaml at 9fc7f75; a copy is in tests/contracts/)
+    onto the static-client shape. Anything off that schema raises ValueError,
+    which the caller treats as "could not ask": lenient parsing would hide drift.
+    A base_domain that is a string but not a plain DNS name is in the schema; it
+    yields no redirect URI, so /authorize refuses it."""
     if not isinstance(doc, dict) or doc.get("client_id") != client_id:
         raise ValueError("client_id")
+    for key in ("deployment_id", "smb_id", "base_domain"):
+        if not isinstance(doc.get(key), str):
+            raise ValueError(key)
     hashes = doc.get("secret_sha256")
-    hashes = [hashes] if isinstance(hashes, str) else hashes  # Fleet stores one (design 607 §4)
-    if not isinstance(hashes, list) or not hashes or not all(
+    if not isinstance(hashes, list) or not 1 <= len(hashes) <= 2 or not all(
         isinstance(h, str) and _SHA256_HEX.fullmatch(h) for h in hashes
     ):
         raise ValueError("secret_sha256")
-    base, scheme, smb = doc.get("base_domain"), doc.get("scheme"), doc.get("smb_id")
-    uris = []
-    if isinstance(base, str) and _HOSTNAME.fullmatch(base) and scheme in ("https", "http"):
-        uris = [f"{scheme}://auth.{base}/oauth2/callback"]  # Fleet's OAUTH2_PROXY_REDIRECT_URL
+    scheme, state, base = doc.get("scheme"), doc.get("state"), doc["base_domain"]
+    if scheme not in ("https", "http"):
+        raise ValueError("scheme")
+    if state not in ("active", "suspended"):
+        raise ValueError("state")
+    ok = _HOSTNAME.fullmatch(base) is not None
     return {
         "client_id": client_id,
         "secret_sha256": hashes,
-        "redirect_uris": [u for u in uris if _strict_redirect_uri_ok(u)],
-        "post_logout_redirect_uris": [],
-        # Fails closed at /mpass-callback when empty: see _corporate_refusal.
-        "smb_binding": smb if isinstance(smb, str) else "",
-        "base_domain": base,
-        "state": doc.get("state"),
+        # Fleet's OAUTH2_PROXY_REDIRECT_URL, and the sign-in host's root.
+        "redirect_uris": [f"{scheme}://auth.{base}/oauth2/callback"] if ok else [],
+        "post_logout_redirect_uris": [f"{scheme}://auth.{base}/"] if ok else [],
+        # "" fails closed at /mpass-callback: see _corporate_refusal.
+        "smb_binding": doc["smb_id"],
+        "state": state,
         "fleet": True,
     }
 
@@ -185,6 +194,15 @@ async def _fetch_registry(client_id: str) -> dict | None:
     except httpx.HTTPError as exc:
         raise RegistryUnavailable(type(exc).__name__) from None
     if r.status_code == 404:
+        # Only the contract's 404 is "no". Any other 404 (a wrong FLEET_REGISTRY_URL,
+        # a proxy in the way) is a misconfiguration, not an answer about the client.
+        try:
+            reason = r.json().get("error")
+        except (ValueError, AttributeError):
+            reason = None
+        if reason not in ("unknown_client", "no_base_domain"):
+            raise RegistryUnavailable("HTTP 404 off the contract")
+        logger.info("central: registry says no client_id=%r reason=%s", client_id, reason)
         return None
     if r.status_code != 200:
         raise RegistryUnavailable(f"HTTP {r.status_code}")
@@ -332,8 +350,6 @@ async def _central_authorize(request: Request) -> Response:
         return _refuse("unknown_client", client_id)
     if _inactive(client):
         return _refuse("client_inactive", client_id)
-    if client.get("fleet") and not client["base_domain"]:
-        return _refuse("no_base_domain", client_id)  # every app is at <app>.<base> (2026-10-06 ruling)
     if not _strict_redirect_uri_ok(redirect_uri) or redirect_uri not in client["redirect_uris"]:
         return _refuse("redirect_refused", client_id)
     # An absent method means "plain" (RFC 7636 §4.3), which is refused.
@@ -616,9 +632,15 @@ async def central_logout(request: Request) -> Response:
         raise HTTPException(status_code=404)
     client_id = request.query_params.get("client_id", "")
     target = request.query_params.get("post_logout_redirect_uri", "")
-    client = m._CLIENTS.get(client_id)
+    try:
+        client = await _lookup(client_id)
+    except RegistryUnavailable:
+        return _unavailable(client_id)
     if client is None:
         return _refuse("unknown_client", client_id)
+    # Exact match only: clusters whitelist this service's host for oauth2-proxy's
+    # sign-out rd, which is safe only while this check is exact (FOSS-607 §3.3).
+    # A suspended deployment may still sign out; the target is its own host.
     if not _strict_redirect_uri_ok(target) or target not in client["post_logout_redirect_uris"]:
         return _refuse("redirect_refused", client_id)
     # Cognito returns to one registered logout_uri (/signed-out); the cookie
@@ -641,7 +663,12 @@ async def central_signed_out(request: Request) -> Response:
         client_id, target = dest["client_id"], dest["uri"]
     except (ValueError, TypeError, KeyError):
         client_id = target = ""
-    client = m._CLIENTS.get(client_id) if isinstance(client_id, str) else None
+    client = None
+    if isinstance(client_id, str):
+        try:
+            client = await _lookup(client_id)  # re-checked: the cookie is the browser's
+        except RegistryUnavailable:
+            client = None  # no redirect then, only the page
     if client is not None and isinstance(target, str) and target in client["post_logout_redirect_uris"]:
         response = RedirectResponse(url=target, status_code=302)
     else:
