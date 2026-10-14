@@ -1,0 +1,8 @@
+{
+  "users": [
+    {"username": "alice", "email": "alice@corp-a.example.com", "corporate_id": "corp-a"},
+    {"username": "adam", "email": "adam@corp-a.example.com", "corporate_id": "corp-a"},
+    {"username": "bob", "email": "bob@corp-b.example.com", "corporate_id": "corp-b"},
+    {"username": "ivan", "email": "ivan@individual.example.com", "is_corporate": false}
+  ]
+}
