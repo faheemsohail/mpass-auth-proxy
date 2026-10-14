@@ -913,3 +913,69 @@ class TestStaticIdsCannotShadowFleet:
 
     def test_static_fd_non_uuid_still_allowed(self):
         assert "fd-a" in c._parse_clients({"clients": [{**PORTAL, "client_id": "fd-a"}]})
+
+
+# ---------------------------------------------------------------------------
+# oauth2-proxy backend logout (OAUTH2_PROXY_BACKEND_LOGOUT_URL =
+# https://auth.<central>/logout?id_token_hint={id_token}). v7.15.5's
+# backendLogout does a server-side http.Get (which FOLLOWS redirects), treats
+# 200 and 204 as success, and only logs anything else; sign-out proceeds.
+# ---------------------------------------------------------------------------
+
+class TestBackendLogout:
+    @pytest.fixture
+    def body(self, fp, stub):
+        return fd_token(fp, code_of(sign_in(fp, stub, "alice", FD1))).json()
+
+    def backend(self, fp, hint):
+        return fp.get("/logout", params={} if hint is None else {"id_token_hint": hint})
+
+    def test_ends_the_session_with_204(self, fp, store, body):
+        r = self.backend(fp, body["id_token"])
+        assert r.status_code == 204 and "location" not in r.headers and r.content == b""
+        assert rkey(body["refresh_token"]) not in store
+        assert refresh(fp, body["refresh_token"]).json()["error"] == "invalid_grant"
+
+    def test_static_client_session(self, fp, stub, store):
+        from tests.test_central import PORTAL_SECRET
+        b = token(fp, code_of(sign_in(fp, stub, "alice", PORTAL))).json()
+        assert self.backend(fp, b["id_token"]).status_code == 204
+        assert rkey(b["refresh_token"]) not in store
+        assert refresh(fp, b["refresh_token"], PORTAL, PORTAL_SECRET).status_code == 400
+
+    def test_expired_hint_still_ends_it(self, fp, store, body):
+        claims = jwt.decode(body["id_token"], options={"verify_signature": False})
+        expired = c._sign({**claims, "iat": claims["iat"] - 7200, "exp": claims["iat"] - 3600})
+        assert self.backend(fp, expired).status_code == 204
+        assert rkey(body["refresh_token"]) not in store
+
+    def test_works_while_fleet_is_down(self, fp, fleet, store, body):
+        c._registry_cache.clear()
+        fleet.down = True
+        assert self.backend(fp, body["id_token"]).status_code == 204
+        assert rkey(body["refresh_token"]) not in store
+
+    def bad_hints(self, fp, body, idp_sign):
+        claims = jwt.decode(body["id_token"], options={"verify_signature": False})
+        return {
+            "none": None, "empty": "", "garbage": "not-a-jwt",
+            "foreign signature": idp_sign(claims),
+            "another issuer": c._sign({**claims, "iss": "https://evil.example.com"}),
+            "aud not a client": c._sign({**claims, "aud": "evil-client"}),
+            "aud of another client": c._sign({**claims, "aud": ID2}),
+            "aud a list": c._sign({**claims, "aud": [ID1, ID2]}),
+            "no sid": c._sign({k: v for k, v in claims.items() if k != "sid"}),
+        }
+
+    def test_bad_hints_get_204_and_delete_nothing(self, fp, store, body, idp_sign):
+        for name, hint in self.bad_hints(fp, body, idp_sign).items():
+            r = self.backend(fp, hint)
+            assert (r.status_code, r.content, "location" in r.headers) == (204, b"", False), name
+            assert rkey(body["refresh_token"]) in store, name
+
+    def test_browser_form_unchanged(self, fp, body):
+        r = fp.get("/logout", params={"client_id": ID1, "post_logout_redirect_uri": f"https://auth.{BASE_1}/",
+                                      "id_token_hint": body["id_token"]})
+        assert r.status_code == 302
+        assert refused(fp.get("/logout", params={"post_logout_redirect_uri": f"https://auth.{BASE_1}/"}))
+        assert refused(fp.get("/logout", params={"client_id": ID1}))

@@ -145,7 +145,7 @@ asked. A suspended deployment may still sign out.
 | `POST /token` | form: `grant_type=authorization_code`, `code`, `code_verifier`, `redirect_uri`, or `grant_type=refresh_token`, `refresh_token`; client auth by `client_secret_basic` **or** `client_secret_post` | 401 `invalid_client`: no, unknown or wrong credentials. 503 `temporarily_unavailable`: Fleet could not be asked (see above). 400 `unauthorized_client`: a Fleet client that is not active. 400 `invalid_request`: both auth methods. 400 `unsupported_grant_type`: anything else. 400 `invalid_grant`: unknown, used or expired (60 s) code; code issued to another client; `redirect_uri` not equal to the one at `/authorize`; a verifier outside RFC 7636's format, or one not matching the challenge. Client authentication runs first: a request with bad credentials leaves the code untouched, but once the client authenticates, the presented code is consumed even if the redemption is then refused |
 | `GET /.well-known/openid-configuration` | | |
 | `GET /.well-known/jwks.json` | | |
-| `GET /logout` | `client_id`, `post_logout_redirect_uri`, optional `id_token_hint` (ends the refresh session, see "Refresh") | 400, no redirect: unknown client, or a URI not exactly in its `post_logout_redirect_uris`. 503: Fleet could not be asked. Success: 302 to the IdP sign-out, which returns to `/signed-out`, which re-checks and returns to the URI |
+| `GET /logout` | browser form: `client_id`, `post_logout_redirect_uri`, optional `id_token_hint` (ends the refresh session, see "Refresh"). Backend form (oauth2-proxy's backend logout): only `id_token_hint`, always 204 | 400, no redirect: unknown client, or a URI not exactly in its `post_logout_redirect_uris`. 503: Fleet could not be asked. Success: 302 to the IdP sign-out, which returns to `/signed-out`, which re-checks and returns to the URI |
 | `GET /signed-out` | `__Host-mpass_logout` cookie | without a valid cookie: a "signed out" page, no redirect |
 
 `/token` success returns `id_token` and `access_token`, both RS256 JWTs signed
@@ -191,9 +191,17 @@ Why it is built this way:
   the token's `sid` names, so a copied session cookie cannot refresh after
   sign-out. The hint must be signed by this service for that `client_id`; an
   expired one still counts. A missing or bad hint is ignored and the sign-out
-  proceeds. **This only works if the cluster's sign-out sends the hint**, which
-  is oauth2-proxy configuration (FOSS-463) and not verified here; without it a
-  copied session still ends at the 12 h bound.
+  proceeds.
+- **The cluster's sign-out sends the hint server-side.** Each cluster sets
+  `OAUTH2_PROXY_BACKEND_LOGOUT_URL=https://auth.<central>/logout?id_token_hint={id_token}`
+  (FOSS-463). On sign-out, oauth2-proxy v7.15.5 makes a server-side GET to it
+  with the session's id_token (outbound only, NAT-safe), accepts 200 or 204,
+  and only logs any other answer; the sign-out proceeds either way. Its
+  `http.Get` follows redirects. So `GET /logout` with neither `client_id` nor
+  `post_logout_redirect_uri` is this backend form: the hint's audience must
+  be a static or `fd-<uuid>` client, the session is deleted as above (no
+  registry call, so this works while Fleet is down), and the answer is always
+  **204, no redirect**, for any hint, valid or not, so it is no oracle.
 - **Accepted cost:** the handles live only in Redis (Valkey). Losing it ends
   every central session at its next refresh (oauth2-proxy refreshes every
   3000 s), and users sign in again.

@@ -670,10 +670,31 @@ async def _end_session(client_id: str, hint: str) -> None:
         logger.info("central: session ended client_id=%r sub=%s", client_id, claims.get("sub"))
 
 
+async def _backend_logout(hint: str) -> None:
+    """oauth2-proxy's backend logout: a server-side GET carrying only the
+    session's id_token. The audience is read unverified only to choose which
+    client to verify against; it must name a static or an fd- client, and
+    _end_session then verifies the signature, issuer and that audience. No
+    registry call: the token is ours, so this works while Fleet is down."""
+    try:
+        aud = jwt.decode(hint, options={"verify_signature": False}).get("aud") if hint else None
+    except InvalidTokenError:
+        aud = None
+    if isinstance(aud, str) and (aud in m._CLIENTS or _FLEET_CLIENT_ID.fullmatch(aud)):
+        await _end_session(aud, hint)
+
+
 @router.get("/logout")
 async def central_logout(request: Request) -> Response:
     if not m._CLIENTS:
         raise HTTPException(status_code=404)
+    q = request.query_params
+    if "client_id" not in q and "post_logout_redirect_uri" not in q:
+        # oauth2-proxy's OAUTH2_PROXY_BACKEND_LOGOUT_URL form. Always 204, no
+        # redirect: v7.15.5 accepts 200 or 204 and its http.Get would follow a
+        # redirect; the same answer for every hint gives no oracle.
+        await _backend_logout(q.get("id_token_hint", ""))
+        return Response(status_code=204)
     client_id = request.query_params.get("client_id", "")
     target = request.query_params.get("post_logout_redirect_uri", "")
     try:
