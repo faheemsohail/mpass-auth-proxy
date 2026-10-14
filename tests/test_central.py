@@ -103,6 +103,12 @@ def proxy(monkeypatch, stub, store):
         async def getdel(self, k):
             return (store.pop(k, None) or (None, None))[1]
 
+        async def get(self, k):
+            return (store.get(k) or (None, None))[1]
+
+        async def delete(self, k):
+            store.pop(k, None)
+
     monkeypatch.setattr(m, "redis_client", Redis())
     monkeypatch.setattr(m, "_jwks_cache", None)
     monkeypatch.setattr(m, "_token_endpoint_cache", None)
@@ -296,8 +302,10 @@ class TestCallback:
         assert data["client_id"] == "foss-portal-sandbox"
         assert data["redirect_uri"] == PORTAL["redirect_uris"][0]
         assert data["code_challenge"] == CHALLENGE
-        # No Cognito token is kept, so none can be handed on.
+        # No Cognito id or access token is kept. The refresh token is kept
+        # server-side, under a name no response uses (FOSS-611).
         assert not {"id_token", "access_token", "refresh_token"} & set(data)
+        assert data["idp_refresh_token"] == "stub-refresh:bob"
 
     def test_clears_flow_cookie(self, proxy, stub):
         sc = sign_in(proxy, stub, "alice").headers["set-cookie"]
@@ -445,8 +453,13 @@ class TestTokenRefusals:
     def test_unknown_code(self, proxy):
         assert _err(token(proxy, "nope")) == "invalid_grant"
 
-    def test_refresh_grant_deferred(self, proxy, code):
+    def test_raw_idp_refresh_token_refused(self, proxy, code):
+        # Refresh exists since FOSS-611, but only for this service's handles.
         r = token(proxy, code, grant_type="refresh_token", refresh_token="stub-refresh:alice")
+        assert r.status_code == 400 and _err(r) == "invalid_grant"
+
+    def test_unknown_grant_type(self, proxy, code):
+        r = token(proxy, code, grant_type="password")
         assert r.status_code == 400 and _err(r) == "unsupported_grant_type"
 
     def test_refresh_grant_needs_client_auth_first(self, proxy):
@@ -460,7 +473,7 @@ class TestTokenIssues:
         r = token(proxy, code_of(sign_in(proxy, stub, "alice", nonce="n-123")), how=how)
         assert r.status_code == 200, r.text
         body = r.json()
-        assert set(body) == {"access_token", "id_token", "token_type", "expires_in"}
+        assert set(body) == {"access_token", "id_token", "token_type", "expires_in", "refresh_token"}
         claims = jwt.decode(body["id_token"], proxy_key(proxy), algorithms=["RS256"],
                             audience="foss-portal-sandbox", issuer=ISSUER)
         assert claims["cognito:username"] == "alice"
@@ -473,7 +486,8 @@ class TestTokenIssues:
 
     def test_no_cognito_tokens_forwarded(self, proxy, stub):
         body = token(proxy, code_of(sign_in(proxy, stub, "alice"))).json()
-        assert "refresh_token" not in body
+        # The refresh token is this service's opaque handle, not Cognito's (FOSS-611).
+        assert "stub-refresh:" not in json.dumps(body)
         # The access token is ours, for this client, not Cognito's.
         a = jwt.decode(body["access_token"], proxy_key(proxy), algorithms=["RS256"],
                        audience="foss-portal-sandbox", issuer=ISSUER)
@@ -504,7 +518,7 @@ class TestDiscovery:
         assert d["jwks_uri"] == f"{ISSUER}/.well-known/jwks.json"
         assert d["end_session_endpoint"] == f"{ISSUER}/logout"
         assert d["code_challenge_methods_supported"] == ["S256"]
-        assert d["grant_types_supported"] == ["authorization_code"]
+        assert d["grant_types_supported"] == ["authorization_code", "refresh_token"]
         assert set(d["token_endpoint_auth_methods_supported"]) == {"client_secret_basic", "client_secret_post"}
 
     def test_jwks_served_even_with_email_capture_off(self, proxy, monkeypatch):

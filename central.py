@@ -95,13 +95,13 @@ def _load_clients(path: str) -> dict[str, dict]:
 
 
 # ---------------------------------------------------------------------------
-# Central mode routes (FOSS-609). Reached only when _CLIENTS is non-empty.
+# Central mode routes (FOSS-609, FOSS-611). Reached only when _CLIENTS is non-empty.
 #
 # Flow state is keyed by an id this service generates (never the caller's
 # state), and carried in a host-only __Host- cookie. The one-time code is bound
-# to client_id, redirect_uri and the PKCE challenge, and holds only the claims
-# to sign: no Cognito token is stored, so none can be handed to a client.
-# Refresh is not offered here (FOSS-611).
+# to client_id, redirect_uri and the PKCE challenge, and holds the claims to
+# sign plus the Cognito refresh token. No Cognito token is ever handed to a
+# client: refresh goes through an opaque handle (_central_refresh).
 # ---------------------------------------------------------------------------
 
 FLOW_COOKIE = "__Host-mpass_flow"
@@ -280,6 +280,41 @@ def _sign(claims: dict, typ: str = "JWT") -> str:
     return jwt.encode(claims, m._SIGNING_PRIVATE_KEY, algorithm="RS256", headers={"kid": m._SIGNING_KID, "typ": typ})
 
 
+def _idp_pair_ok(id_claims: dict, access: dict) -> bool:
+    """Both tokens are this pool's, for our Cognito client, for one user: the
+    corporate claims come from the access token and are copied onwards."""
+    return (
+        access.get("client_id") == m.OIDC_CLIENT_ID
+        and access.get("token_use") == "access"
+        and bool(id_claims.get("sub"))
+        and access.get("sub") == id_claims.get("sub")
+    )
+
+
+def _claims_to_sign(id_claims: dict, access: dict) -> dict:
+    claims = {k: id_claims[k] for k in _COPIED_ID_CLAIMS if k in id_claims}
+    claims.update({k: access[k] for k in _COPIED_CORPORATE_CLAIMS if k in access})
+    return claims
+
+
+def _token_body(client_id: str, claims: dict, nonce: str = "", refresh_handle: str = "") -> Response:
+    now = int(time.time())
+    base = {**claims, "iss": m.MPASS_PROXY_ISSUER_URL, "aud": client_id,
+            "iat": now, "exp": now + CENTRAL_TOKEN_TTL}
+    id_claims = {**base, "token_use": "id"}
+    if nonce:
+        id_claims["nonce"] = nonce
+    body = {
+        "access_token": _sign({**base, "token_use": "access"}, typ="at+jwt"),
+        "id_token": _sign(id_claims),
+        "token_type": "Bearer",
+        "expires_in": CENTRAL_TOKEN_TTL,
+    }
+    if refresh_handle:
+        body["refresh_token"] = refresh_handle
+    return Response(content=json.dumps(body), media_type="application/json")
+
+
 def _minted_during_flow(claims: dict, created_at: int) -> bool:
     iat = claims.get("iat")
     return type(iat) is int and iat >= created_at - FLOW_TOKEN_SKEW
@@ -372,14 +407,7 @@ async def _central_callback_impl(request: Request) -> Response:
     except httpx.HTTPError as exc:
         logger.error("central: IdP JWKS fetch failed: %s", exc)
         return _refuse("idp_unavailable", client_id, 502)
-    # Both tokens must be this pool's, for our Cognito client, for one user:
-    # the corporate claims come from the access token and are copied onwards.
-    if (
-        access.get("client_id") != m.OIDC_CLIENT_ID
-        or access.get("token_use") != "access"
-        or not id_claims.get("sub")
-        or access.get("sub") != id_claims.get("sub")
-    ):
+    if not _idp_pair_ok(id_claims, access):
         return _refuse("invalid_token", client_id, 401)
     if not (_minted_during_flow(id_claims, flow["created_at"]) and _minted_during_flow(access, flow["created_at"])):
         return _refuse("tokens_predate_flow", client_id, 401)
@@ -394,8 +422,7 @@ async def _central_callback_impl(request: Request) -> Response:
         params = {"error": "access_denied", "error_description": reason, "state": flow["state"]}
         return RedirectResponse(url=f"{flow['redirect_uri']}{sep}{urlencode(params)}", status_code=302)
 
-    claims = {k: id_claims[k] for k in _COPIED_ID_CLAIMS if k in id_claims}
-    claims.update({k: access[k] for k in _COPIED_CORPORATE_CLAIMS if k in access})
+    claims = _claims_to_sign(id_claims, access)
     code = secrets.token_urlsafe(32)
     await m.redis_client.setex(f"central_code:{code}", m.BRIDGE_CODE_TTL, json.dumps({
         "client_id": client_id,
@@ -403,15 +430,17 @@ async def _central_callback_impl(request: Request) -> Response:
         "code_challenge": flow["code_challenge"],
         "nonce": flow["nonce"],
         "claims": claims,
+        # Kept server-side only: /token hands the client an opaque handle to it.
+        "idp_refresh_token": request.query_params.get("refresh_token", ""),
     }))
     logger.info("central: code issued client_id=%r sub=%s", client_id, id_claims["sub"])
     params = {"code": code, "state": flow["state"]}
     return RedirectResponse(url=f"{flow['redirect_uri']}{sep}{urlencode(params)}", status_code=302)
 
 
-async def _authenticate_client(request: Request, form) -> str | Response:
+async def _authenticate_client(request: Request, form) -> dict | Response:
     """client_secret_basic or client_secret_post, never both. Returns the
-    authenticated client_id, or the error response."""
+    authenticated, active client's entry, or the error response."""
     header = request.headers.get("authorization", "")
     if header:
         if "client_secret" in form:
@@ -448,16 +477,19 @@ async def _authenticate_client(request: Request, form) -> str | Response:
     if _inactive(client):
         logger.info("central: refused outcome=client_inactive client_id=%r", client_id)
         return m._token_error("unauthorized_client", "Client is not active")
-    return client_id
+    return client
 
 
 async def _central_token(request: Request) -> Response:
     form = await request.form()
-    client_id = await _authenticate_client(request, form)
-    if isinstance(client_id, Response):
-        return client_id
+    client = await _authenticate_client(request, form)
+    if isinstance(client, Response):
+        return client
+    client_id = client["client_id"]
+    if form.get("grant_type") == "refresh_token":
+        return await _central_refresh(client, str(form.get("refresh_token", "")))
     if form.get("grant_type") != "authorization_code":
-        return m._token_error("unsupported_grant_type", "Only authorization_code is supported")
+        return m._token_error("unsupported_grant_type", "Only authorization_code and refresh_token are supported")
 
     code = str(form.get("code", ""))
     # getdel before any check: a failed redemption burns the code.
@@ -478,20 +510,84 @@ async def _central_token(request: Request) -> Response:
         logger.info("central: refused outcome=%s client_id=%r", failure, client_id)
         return m._token_error("invalid_grant", "Code was not issued for this request")
 
-    now = int(time.time())
-    base = {**data["claims"], "iss": m.MPASS_PROXY_ISSUER_URL, "aud": client_id,
-            "iat": now, "exp": now + CENTRAL_TOKEN_TTL}
-    id_claims = {**base, "token_use": "id"}
-    if data["nonce"]:
-        id_claims["nonce"] = data["nonce"]
-    body = {
-        "access_token": _sign({**base, "token_use": "access"}, typ="at+jwt"),
-        "id_token": _sign(id_claims),
-        "token_type": "Bearer",
-        "expires_in": CENTRAL_TOKEN_TTL,
-    }
+    handle = ""
+    if data.get("idp_refresh_token"):
+        handle = secrets.token_urlsafe(32)
+        await m.redis_client.setex(f"central_refresh:{handle}", m.SESSION_EXPIRES_IN, json.dumps({
+            "client_id": client_id, "sub": data["claims"].get("sub"),
+            "idp_refresh_token": data["idp_refresh_token"],
+        }))
     logger.info("central: token issued client_id=%r sub=%s", client_id, data["claims"].get("sub"))
-    return Response(content=json.dumps(body), media_type="application/json")
+    return _token_body(client_id, data["claims"], data["nonce"], handle)
+
+
+def _oauth_error(resp: httpx.Response) -> str:
+    try:
+        return str(resp.json().get("error", ""))
+    except (ValueError, AttributeError):
+        return ""
+
+
+async def _central_refresh(client: dict, handle: str) -> Response:
+    """refresh_token grant. The handle is ours and bound to one client; the
+    Cognito refresh token behind it never leaves this service. Not rotated, so
+    a second delivery of the same refresh succeeds (oauth2-proxy can refresh
+    concurrently). The client's state was checked by _authenticate_client; the
+    corporate binding is checked here against the fresh Cognito tokens.
+
+    A refusal that is an answer (unknown handle, the IdP says no, the binding
+    fails) burns the handle; "we could not ask" (IdP unreachable) keeps it."""
+    client_id = client["client_id"]
+    key = f"central_refresh:{handle}"
+    raw = await m.redis_client.get(key) if handle else None
+    rec = json.loads(raw) if raw else None
+    if rec is None or rec["client_id"] != client_id:
+        logger.info("central: refused outcome=refresh_unknown client_id=%r", client_id)
+        return m._token_error("invalid_grant", "Invalid or expired refresh token")
+
+    payload = {"grant_type": "refresh_token", "client_id": m.OIDC_CLIENT_ID,
+               "refresh_token": rec["idp_refresh_token"]}
+    if m.OIDC_CLIENT_SECRET:
+        payload["client_secret"] = m.OIDC_CLIENT_SECRET
+    try:
+        token_url = await m._get_token_endpoint()
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            resp = await http.post(token_url, data=payload)
+        # Only invalid_grant is about the user's token. invalid_client and the
+        # rest are about us (a wrong central secret): burning on those would
+        # end every session over a misconfiguration.
+        if resp.status_code == 400 and _oauth_error(resp) == "invalid_grant":
+            await m.redis_client.delete(key)
+            logger.info("central: refused outcome=refresh_idp_refused client_id=%r sub=%s", client_id, rec["sub"])
+            return m._token_error("invalid_grant", "Refresh token no longer valid")
+        resp.raise_for_status()
+        tokens = resp.json()
+        id_claims = await _verify_idp_jwt(str(tokens.get("id_token", "")), audience=m.OIDC_CLIENT_ID)
+        access = await _verify_idp_jwt(str(tokens.get("access_token", "")), options={"verify_aud": False})
+    except (httpx.HTTPError, ValueError) as exc:  # unreachable, 5xx, or a reply we cannot read
+        logger.error("central: refresh IdP unavailable client_id=%r: %s", client_id, type(exc).__name__)
+        return m._token_error("temporarily_unavailable", "Identity provider unavailable", 503)
+    except InvalidTokenError:
+        logger.error("central: refresh IdP returned an invalid token client_id=%r", client_id)
+        return m._token_error("temporarily_unavailable", "Identity provider unavailable", 503)
+    if not _idp_pair_ok(id_claims, access) or id_claims["sub"] != rec["sub"]:
+        await m.redis_client.delete(key)
+        logger.warning("central: refused outcome=refresh_wrong_subject client_id=%r sub=%s", client_id, rec["sub"])
+        return m._token_error("invalid_grant", "Refresh token no longer valid")
+
+    reason = _corporate_refusal(client, access)
+    if reason:
+        await m.redis_client.delete(key)
+        logger.info("central: refused outcome=access_denied reason=%s client_id=%r sub=%s",
+                    reason, client_id, rec["sub"])
+        return Response(status_code=403, media_type="application/json",
+                        content=json.dumps({"error": "access_denied", "error_description": reason}))
+
+    if tokens.get("refresh_token"):  # Cognito rotation, if it is ever turned on
+        rec["idp_refresh_token"] = tokens["refresh_token"]
+    await m.redis_client.setex(key, m.SESSION_EXPIRES_IN, json.dumps(rec))
+    logger.info("central: token refreshed client_id=%r sub=%s", client_id, rec["sub"])
+    return _token_body(client_id, _claims_to_sign(id_claims, access), refresh_handle=handle)
 
 
 @router.get("/.well-known/openid-configuration")
@@ -506,7 +602,7 @@ async def openid_configuration() -> dict:
         "jwks_uri": f"{iss}/.well-known/jwks.json",
         "end_session_endpoint": f"{iss}/logout",
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
         "subject_types_supported": ["public"],
         "id_token_signing_alg_values_supported": ["RS256"],
         "code_challenge_methods_supported": ["S256"],

@@ -54,6 +54,10 @@ class FakeFleet:
             e = self.entries.get(client_id)
             return JSONResponse(e) if e else JSONResponse({"detail": "not found"}, status_code=404)
 
+        @self.app.post("/idp-token/{error}")
+        def idp_token(error: str):  # an IdP token endpoint that answers with an OAuth error
+            return JSONResponse({"error": error}, status_code=400)
+
     def add(self, **kw):
         e = entry(**kw)
         self.entries[e["client_id"]] = e
@@ -458,3 +462,126 @@ class TestConfig:
         # The refusals above are the Fleet settings', not some other defect's.
         mod = self._import(monkeypatch, tmp_path, CLIENTS_FILE=None, COOKIE_DOMAIN=".example.com")
         assert mod._CLIENTS == {}
+
+
+# ---------------------------------------------------------------------------
+# Refresh (FOSS-611): an opaque handle bound to the client; the Cognito
+# refresh token stays server-side. State and the corporate binding are
+# re-checked on every refresh.
+# ---------------------------------------------------------------------------
+
+def refresh(proxy, handle, client=FD1, secret=SECRET_1):
+    return token(proxy, None, client, secret=secret, grant_type="refresh_token", refresh_token=handle,
+                 code_verifier=None, redirect_uri=None)
+
+
+class TestRefresh:
+    @pytest.fixture
+    def handle(self, fp, stub):
+        body = fd_token(fp, code_of(sign_in(fp, stub, "alice", FD1))).json()
+        return body["refresh_token"]
+
+    def test_issues_an_opaque_handle_not_the_idp_token(self, fp, stub, store, handle):
+        assert not handle.startswith("stub-refresh:") and len(handle) >= 32
+        ttl, raw = store[f"central_refresh:{handle}"]
+        assert ttl == m.SESSION_EXPIRES_IN
+        rec = json.loads(raw)
+        assert rec["client_id"] == "fd-1111" and rec["idp_refresh_token"] == "stub-refresh:alice"
+
+    def test_refresh_reissues_for_this_client(self, fp, handle):
+        r = refresh(fp, handle)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["refresh_token"] == handle
+        assert "stub-refresh:" not in r.text
+        claims = jwt.decode(body["id_token"], proxy_key(fp), algorithms=["RS256"], audience="fd-1111", issuer=ISSUER)
+        assert claims["custom:corporate_id"] == "corp-a"
+        jwt.decode(body["access_token"], proxy_key(fp), algorithms=["RS256"], audience="fd-1111", issuer=ISSUER)
+
+    def test_replay_is_idempotent(self, fp, handle):
+        # Not rotated: oauth2-proxy may refresh twice concurrently, and a
+        # second delivery must not log the user out.
+        assert refresh(fp, handle).status_code == 200
+        assert refresh(fp, handle).status_code == 200
+
+    def test_handle_of_x_refused_at_y(self, fp, handle):
+        r = refresh(fp, handle, FD2, SECRET_2)
+        assert r.status_code == 400 and r.json()["error"] == "invalid_grant"
+
+    def test_wrong_secret(self, fp, handle):
+        assert refresh(fp, handle, secret="wrong").status_code == 401
+
+    @pytest.mark.parametrize("h", ["", "nope", "stub-refresh:alice"])
+    def test_unknown_handle(self, fp, handle, h):
+        r = refresh(fp, h)
+        assert r.status_code == 400 and r.json()["error"] == "invalid_grant"
+
+    def test_suspended(self, fp, fleet, handle):
+        fleet.add(state="suspended")
+        c._registry_cache.clear()
+        r = refresh(fp, handle)
+        assert r.status_code == 400 and r.json()["error"] == "unauthorized_client"
+
+    def test_decommissioned(self, fp, fleet, handle):
+        del fleet.entries["fd-1111"]
+        c._registry_cache.clear()
+        assert refresh(fp, handle).status_code == 401
+
+    def test_fleet_down_uncached_is_503(self, fp, fleet, handle):
+        c._registry_cache.clear()
+        fleet.down = True
+        assert refresh(fp, handle).status_code == 503
+
+    @pytest.mark.parametrize("smb", ["corp-b", None, ""])
+    def test_corporate_binding_rechecked(self, fp, fleet, store, handle, smb):
+        fleet.add(smb=smb)
+        c._registry_cache.clear()
+        r = refresh(fp, handle)
+        assert r.status_code == 403 and r.json()["error"] == "access_denied"
+        assert f"central_refresh:{handle}" not in store  # an answer, so the handle is burned
+
+    def test_idp_refuses_burns_the_handle(self, fp, store, handle):
+        ttl, raw = store[f"central_refresh:{handle}"]
+        store[f"central_refresh:{handle}"] = (ttl, json.dumps({**json.loads(raw), "idp_refresh_token": "revoked"}))
+        r = refresh(fp, handle)
+        assert r.status_code == 400 and r.json()["error"] == "invalid_grant"
+        assert f"central_refresh:{handle}" not in store
+
+    def test_idp_for_another_user_refused(self, fp, store, handle):
+        ttl, raw = store[f"central_refresh:{handle}"]
+        store[f"central_refresh:{handle}"] = (ttl, json.dumps({**json.loads(raw), "idp_refresh_token": "stub-refresh:adam"}))
+        r = refresh(fp, handle)
+        assert r.status_code == 400 and r.json()["error"] == "invalid_grant"
+
+    def test_idp_unreachable_keeps_the_handle(self, fp, store, handle, monkeypatch):
+        async def down():
+            raise httpx.ConnectError("down")
+        monkeypatch.setattr(m, "_get_token_endpoint", down)
+        r = refresh(fp, handle)
+        assert r.status_code == 503 and r.json()["error"] == "temporarily_unavailable"
+        assert f"central_refresh:{handle}" in store  # could not ask is not no
+
+    def test_static_client_refresh_keeps_its_rule(self, fp, stub):
+        from tests.test_central import PORTAL_SECRET
+        body = token(fp, code_of(sign_in(fp, stub, "ivan", PORTAL))).json()
+        assert refresh(fp, body["refresh_token"], PORTAL, PORTAL_SECRET).status_code == 200
+
+    def test_no_handle_or_idp_token_in_logs(self, fp, stub, caplog):
+        caplog.set_level(logging.DEBUG)
+        body = fd_token(fp, code_of(sign_in(fp, stub, "alice", FD1))).json()
+        refresh(fp, body["refresh_token"])
+        refresh(fp, body["refresh_token"], FD2, SECRET_2)
+        assert body["refresh_token"] not in caplog.text and "stub-refresh:alice" not in caplog.text
+
+    def test_discovery_offers_refresh(self, fp):
+        assert "refresh_token" in fp.get("/.well-known/openid-configuration").json()["grant_types_supported"]
+
+    @pytest.mark.parametrize("error", ["invalid_client", "unauthorized_client", "invalid_request"])
+    def test_idp_refusing_us_not_the_user_keeps_the_handle(self, fp, store, handle, monkeypatch, error):
+        # A wrong central client secret is our misconfiguration: it must not
+        # burn every user's session. Only invalid_grant is about the token.
+        async def endpoint():
+            return f"http://{FLEET_HOST}/idp-token/{error}"
+        monkeypatch.setattr(m, "_get_token_endpoint", endpoint)
+        assert refresh(fp, handle).status_code == 503
+        assert f"central_refresh:{handle}" in store
