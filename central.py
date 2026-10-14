@@ -122,6 +122,128 @@ _COPIED_ID_CLAIMS = ("sub", "email", "cognito:username")
 _COPIED_CORPORATE_CLAIMS = ("custom:is_corporate", "custom:corporate_id")
 
 
+# ---------------------------------------------------------------------------
+# Fleet's registry (FOSS-611, Plan 3 §4). Static clients are looked up first;
+# only `fd-` ids go to Fleet. Three answers, kept apart:
+#   an entry   -- "yes", cached REGISTRY_TTL s;
+#   None       -- "no" (404, or an id Fleet cannot hold), never cached;
+#   RegistryUnavailable -- "we could not ask" (unreachable, non-200/404, or a
+#                 reply off the §4.1 shape). The last real "yes" is served for
+#                 up to REGISTRY_STALE_MAX s, then 503. Never a 400.
+# One attempt per request, bounded by REGISTRY_TIMEOUT: the browser's or
+# oauth2-proxy's own retry is the retry, so an outage costs Fleet no more load.
+# ---------------------------------------------------------------------------
+
+REGISTRY_TTL: int = 30
+REGISTRY_STALE_MAX: int = 600
+REGISTRY_TIMEOUT: float = 3.0
+_FLEET_CLIENT_ID = re.compile(r"fd-[A-Za-z0-9-]{1,64}")
+# A lowercase DNS name of two or more labels: nothing that can carry a port,
+# userinfo, path, `\` or `%` into the redirect URI built from it.
+_HOSTNAME = re.compile(r"(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
+_registry_cache: dict[str, tuple[float, dict]] = {}  # client_id -> (answered_at, entry)
+
+
+class RegistryUnavailable(Exception):
+    """Fleet could not be asked. Not "no": callers answer 503, never 400."""
+
+
+def _fleet_entry(client_id: str, doc) -> dict:
+    """Map a §4.1 reply onto the static-client shape. Raises ValueError on a
+    reply off that shape. A missing base_domain or an unknown scheme is not a
+    defect here: it leaves redirect_uris empty, and /authorize refuses."""
+    if not isinstance(doc, dict) or doc.get("client_id") != client_id:
+        raise ValueError("client_id")
+    hashes = doc.get("secret_sha256")
+    hashes = [hashes] if isinstance(hashes, str) else hashes  # Fleet stores one (design 607 §4)
+    if not isinstance(hashes, list) or not hashes or not all(
+        isinstance(h, str) and _SHA256_HEX.fullmatch(h) for h in hashes
+    ):
+        raise ValueError("secret_sha256")
+    base, scheme, smb = doc.get("base_domain"), doc.get("scheme"), doc.get("smb_id")
+    uris = []
+    if isinstance(base, str) and _HOSTNAME.fullmatch(base) and scheme in ("https", "http"):
+        uris = [f"{scheme}://auth.{base}/oauth2/callback"]  # Fleet's OAUTH2_PROXY_REDIRECT_URL
+    return {
+        "client_id": client_id,
+        "secret_sha256": hashes,
+        "redirect_uris": [u for u in uris if _strict_redirect_uri_ok(u)],
+        "post_logout_redirect_uris": [],
+        # Fails closed at /mpass-callback when empty: see _corporate_refusal.
+        "smb_binding": smb if isinstance(smb, str) else "",
+        "base_domain": base,
+        "state": doc.get("state"),
+        "fleet": True,
+    }
+
+
+async def _fetch_registry(client_id: str) -> dict | None:
+    url = f"{m.FLEET_REGISTRY_URL}/internal/auth/clients/{client_id}"
+    try:
+        async with httpx.AsyncClient(timeout=REGISTRY_TIMEOUT) as http:
+            r = await http.get(url, headers={"Authorization": f"Bearer {m.FLEET_BROKER_TOKEN}"})
+    except httpx.HTTPError as exc:
+        raise RegistryUnavailable(type(exc).__name__) from None
+    if r.status_code == 404:
+        return None
+    if r.status_code != 200:
+        raise RegistryUnavailable(f"HTTP {r.status_code}")
+    try:
+        return _fleet_entry(client_id, r.json())
+    except ValueError as exc:  # JSONDecodeError included
+        raise RegistryUnavailable(f"malformed reply ({exc})") from None
+
+
+async def _lookup(client_id: str) -> dict | None:
+    """The client's entry, None for "no such client", or RegistryUnavailable."""
+    static = m._CLIENTS.get(client_id)
+    if static is not None or not m.FLEET_REGISTRY_URL or not _FLEET_CLIENT_ID.fullmatch(client_id):
+        return static
+    now = time.time()
+    hit = _registry_cache.get(client_id)
+    if hit and now - hit[0] < REGISTRY_TTL:
+        return hit[1]
+    try:
+        found = await _fetch_registry(client_id)
+    except RegistryUnavailable as exc:
+        stale = hit is not None and now - hit[0] < REGISTRY_STALE_MAX
+        logger.warning("broker.registry_unavailable client_id=%r cause=%s serving_stale=%s",
+                       client_id, exc, stale)
+        if stale:
+            return hit[1]  # served, never re-stamped: the clock runs from Fleet's last answer
+        raise
+    if found is None:
+        _registry_cache.pop(client_id, None)
+    else:
+        _registry_cache[client_id] = (now, found)
+    return found
+
+
+def _unavailable(client_id: str) -> Response:
+    return _refuse("registry_unavailable", client_id, 503,
+                   "Sign-in is temporarily unavailable. Try again in a few minutes.")
+
+
+def _inactive(client: dict) -> bool:
+    return client.get("fleet", False) and client["state"] != "active"
+
+
+def _corporate_refusal(client: dict, access: dict) -> str:
+    """"" to admit, else the access_denied reason. Equality is verbatim, and a
+    Fleet entry with no SMB admits no one: a missing binding must never match
+    a missing claim."""
+    binding = client["smb_binding"]
+    if client.get("fleet") and not binding:
+        return "no_smb_binding"
+    if binding is None:
+        return ""  # a static client with no binding (the portal checks the claims itself)
+    if access.get("custom:is_corporate") != "true":
+        return "not_corporate"
+    if access.get("custom:corporate_id") != binding:
+        return "wrong_organization"
+    return ""
+
+
 def _set_host_cookie(response: Response, key: str, value: str, max_age: int) -> None:
     response.set_cookie(key, value, max_age=max_age, path="/", secure=True, httponly=True, samesite="lax")
 
@@ -167,9 +289,16 @@ async def _central_authorize(request: Request) -> Response:
     q = request.query_params
     client_id = q.get("client_id", "")
     redirect_uri = q.get("redirect_uri", "")
-    client = m._CLIENTS.get(client_id)
+    try:
+        client = await _lookup(client_id)
+    except RegistryUnavailable:
+        return _unavailable(client_id)
     if client is None:
         return _refuse("unknown_client", client_id)
+    if _inactive(client):
+        return _refuse("client_inactive", client_id)
+    if client.get("fleet") and not client["base_domain"]:
+        return _refuse("no_base_domain", client_id)  # every app is at <app>.<base> (2026-10-06 ruling)
     if not _strict_redirect_uri_ok(redirect_uri) or redirect_uri not in client["redirect_uris"]:
         return _refuse("redirect_refused", client_id)
     # An absent method means "plain" (RFC 7636 §4.3), which is refused.
@@ -184,6 +313,7 @@ async def _central_authorize(request: Request) -> Response:
     await m.redis_client.setex(f"central_flow:{flow_id}", m.BRIDGE_STATE_TTL, json.dumps({
         "client_id": client_id,
         "redirect_uri": redirect_uri,
+        "smb_id": client["smb_binding"],
         "state": q["state"],
         "code_challenge": q["code_challenge"],
         "nonce": q.get("nonce", ""),
@@ -214,9 +344,18 @@ async def _central_callback_impl(request: Request) -> Response:
         ))
     flow = json.loads(raw)
     client_id = flow["client_id"]
-    client = m._CLIENTS.get(client_id)
-    if client is None or flow["redirect_uri"] not in client["redirect_uris"]:
-        return _refuse("unknown_client", client_id)  # deregistered mid-flow (a restart with a new CLIENTS_FILE; Fleet later)
+    try:
+        client = await _lookup(client_id)
+    except RegistryUnavailable:
+        return _unavailable(client_id)
+    # Deregistered, suspended or changed mid-flow: a CLIENTS_FILE restart, or Fleet.
+    if (
+        client is None
+        or _inactive(client)
+        or flow["redirect_uri"] not in client["redirect_uris"]
+        or flow.get("smb_id") != client["smb_binding"]
+    ):
+        return _refuse("unknown_client", client_id)
 
     id_token = request.query_params.get("id_token", "")
     access_token = request.query_params.get("access_token", "")
@@ -245,13 +384,7 @@ async def _central_callback_impl(request: Request) -> Response:
     if not (_minted_during_flow(id_claims, flow["created_at"]) and _minted_during_flow(access, flow["created_at"])):
         return _refuse("tokens_predate_flow", client_id, 401)
 
-    binding = client["smb_binding"]
-    reason = ""
-    if binding is not None:
-        if access.get("custom:is_corporate") != "true":
-            reason = "not_corporate"
-        elif access.get("custom:corporate_id") != binding:
-            reason = "wrong_organization"
+    reason = _corporate_refusal(client, access)
     sep = "&" if "?" in flow["redirect_uri"] else "?"
     if reason:
         # RFC 6749 §4.1.2.1: the redirect_uri is registered and the flow is
@@ -276,7 +409,7 @@ async def _central_callback_impl(request: Request) -> Response:
     return RedirectResponse(url=f"{flow['redirect_uri']}{sep}{urlencode(params)}", status_code=302)
 
 
-def _authenticate_client(request: Request, form) -> str | Response:
+async def _authenticate_client(request: Request, form) -> str | Response:
     """client_secret_basic or client_secret_post, never both. Returns the
     authenticated client_id, or the error response."""
     header = request.headers.get("authorization", "")
@@ -300,7 +433,10 @@ def _authenticate_client(request: Request, form) -> str | Response:
         client_id = str(form.get("client_id", ""))
         secret = str(form.get("client_secret", ""))
 
-    client = m._CLIENTS.get(client_id)
+    try:
+        client = await _lookup(client_id)
+    except RegistryUnavailable:
+        return m._token_error("temporarily_unavailable", "Client registry unavailable", 503)
     digest = hashlib.sha256(secret.encode()).hexdigest()
     if client is None or not secret or not any(
         hmac.compare_digest(digest, h) for h in client["secret_sha256"]
@@ -309,12 +445,15 @@ def _authenticate_client(request: Request, form) -> str | Response:
         response = m._token_error("invalid_client", "Client authentication failed", 401)
         response.headers["WWW-Authenticate"] = 'Basic realm="mpass-auth-proxy"'
         return response
+    if _inactive(client):
+        logger.info("central: refused outcome=client_inactive client_id=%r", client_id)
+        return m._token_error("unauthorized_client", "Client is not active")
     return client_id
 
 
 async def _central_token(request: Request) -> Response:
     form = await request.form()
-    client_id = _authenticate_client(request, form)
+    client_id = await _authenticate_client(request, form)
     if isinstance(client_id, Response):
         return client_id
     if form.get("grant_type") != "authorization_code":

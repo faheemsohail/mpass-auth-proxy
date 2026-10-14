@@ -104,6 +104,23 @@ import central  # noqa: E402  (reads main's attributes only at call time)
 
 _CLIENTS_FILE: str = os.environ.get("CLIENTS_FILE", "").strip()
 _CLIENTS: dict[str, dict] = central._load_clients(_CLIENTS_FILE) if _CLIENTS_FILE else {}
+# FOSS-611: per-deployment `fd-` clients come from Fleet's registry
+# (GET /internal/auth/clients/{client_id}). Central mode only; both or neither.
+FLEET_REGISTRY_URL: str = os.environ.get("FLEET_REGISTRY_URL", "").strip().rstrip("/")
+FLEET_BROKER_TOKEN: str = os.environ.get("FLEET_BROKER_TOKEN", "").strip()
+if (FLEET_REGISTRY_URL or FLEET_BROKER_TOKEN) and not _CLIENTS:
+    raise RuntimeError(
+        "FLEET_REGISTRY_URL / FLEET_BROKER_TOKEN are central-mode settings, and "
+        "CLIENTS_FILE is unset. Unset them rather than leave a setting that looks "
+        "enforced and is not."
+    )
+if bool(FLEET_REGISTRY_URL) != bool(FLEET_BROKER_TOKEN) or (
+    FLEET_REGISTRY_URL and not FLEET_REGISTRY_URL.startswith(("https://", "http://"))
+):
+    raise RuntimeError(
+        "Set both FLEET_REGISTRY_URL (Fleet's http(s) base URL) and "
+        "FLEET_BROKER_TOKEN, or neither."
+    )
 
 REDIS_URL: str = os.environ["REDIS_URL"]
 # Central mode sets only the host-only __Host-mpass_flow cookie, so it has no
